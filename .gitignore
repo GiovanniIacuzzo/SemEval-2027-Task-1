@@ -1,0 +1,7 @@
+idea.md
+.env
+starter_kit/
+data/
+checkpoints/
+outputs/
+__pycache__/

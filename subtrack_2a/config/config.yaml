@@ -1,0 +1,94 @@
+general:
+  seed: 42
+  run_tag: "mac_smoke_test"
+  device: "auto"
+  mixed_precision: false
+  logging_level: "INFO"
+
+paths:
+  data_mode: "full"
+  full_data_dir: "data/reteco_data/track2_recor"
+  sample_data_dir: "data/sample/track2_recor"
+  checkpoint_dir: "checkpoints/subtrack_2a"
+  output_dir: "outputs/subtrack_2a"
+  log_dir: "outputs/subtrack_2a/logs"
+  dev_run_file: "outputs/subtrack_2a/dev_run.trec"
+  submission_file: "outputs/subtrack_2a/submission_2a.trec"
+
+domains:
+  active_domains:
+    - "drones"
+
+data:
+  query_strategy: "concat"
+  max_query_length: 128
+  max_doc_length: 128
+  num_workers: 0
+  pin_memory: false
+  use_triplets: true
+  negatives_per_positive: 1
+  negative_sampling_strategy: "random"
+
+bi_encoder:
+  model_name_or_path: "BAAI/bge-base-en-v1.5"
+  pooling_strategy: "mean"
+  normalize_embeddings: true
+  temperature: 0.05
+  max_seq_length: 128
+
+cross_encoder:
+  enabled: false
+  model_name_or_path: "BAAI/bge-reranker-base"
+  max_seq_length: 128
+  num_labels: 1
+  batch_size: 16
+
+sparse:
+  enabled: true
+  k1: 0.9
+  b: 0.4
+  top_k_candidates: 50
+
+hybrid_fusion:
+  enabled: true
+  rrf_k: 60
+  top_candidates_to_rerank: 50
+
+training:
+  epochs: 1
+  batch_size: 8
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  save_best_only: true
+  monitor_metric: "val_loss"
+  early_stopping_patience: 1
+  log_every_n_steps: 5
+
+evaluation:
+  split: "dev"
+  eval_batch_size: 32
+  official_metric: "ndcg_cut_10"
+  cutoff_k: 10
+  save_json_results: true
+
+submission:
+  target_split: "dev"
+  run_tag: "SMOKE_TEST_2A"
+  max_rank_per_query: 10
+  strict_validation: true
+
+
+huggingface:
+  repo_name: "reteco-2a-bge-base"
+  model_dir: "checkpoints/subtrack_2a/best_hf_model"  
+  private: true
+  create_model_card: true
+  commit_message: "Upload checkpoint addestrato per SemEval-2027 Sub-track 2a (RECOR)"  
+  ignore_patterns:
+    - "*.DS_Store"
+    - "*.log"
+    - "*.tmp"
+    - "__pycache__/*"

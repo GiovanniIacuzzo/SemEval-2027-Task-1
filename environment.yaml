@@ -1,0 +1,28 @@
+name: semeval
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip>=23.3
+  - git
+  - openjdk>=11
+  - pip:
+      - torch>=2.1.0
+      - torchvision
+      - torchaudio
+      - transformers>=4.40.0
+      - accelerate>=0.28.0
+      - peft>=0.10.0
+      - sentencepiece>=0.2.0
+      - protobuf
+      - pytrec_eval>=0.5
+      - huggingface_hub>=0.23
+      - pyyaml>=6.0
+      - numpy>=1.24.0,<2.0.0
+      - tqdm>=4.66.0
+      - matplotlib>=3.8.0      
+      - gensim>=4.3.2
+      - pyserini>=0.22.0
