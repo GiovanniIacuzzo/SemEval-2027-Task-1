@@ -304,6 +304,10 @@ def run_training(config: Dict[str, Any], logger: logging.Logger) -> None:
 
     all_train_samples: List[ConversationalTurnSample] = []
     combined_corpus: Dict[str, str] = {}
+    combined_hard_negatives: Dict[str, List[str]] = {}
+
+    sampling_strat = data_cfg.get("negative_sampling_strategy", "bm25_hard")
+    logger.info(f"Strategia di campionamento negativi: '{sampling_strat}'")
 
     for domain in domains_to_load:
         try:
@@ -313,11 +317,23 @@ def run_training(config: Dict[str, Any], logger: logging.Logger) -> None:
                 split="train",
                 query_strategy=data_cfg.get("query_strategy", "concat"),
             )
+            # Normalizzazione prefissi per evitare collisioni di ID tra domini
             for doc_id, text in corpus.items():
                 combined_corpus[f"{domain}_{doc_id}"] = text
             for s in samples:
                 s.gold_doc_ids = [f"{domain}_{gid}" for gid in s.gold_doc_ids]
                 all_train_samples.append(s)
+
+            # Estrazione Hard Negatives tramite BM25 se richiesto
+            if sampling_strat in ["bm25_hard", "mixed"]:
+                from dataset.dataset import mine_domain_bm25_hard_negatives
+                dom_hard_negs = mine_domain_bm25_hard_negatives(
+                    corpus=corpus,
+                    samples=samples,
+                    top_k=20,
+                    domain_prefix=domain
+                )
+                combined_hard_negatives.update(dom_hard_negs)
 
             logger.info(f"  [{domain:<18}] Corpus: {len(corpus):>6} docs | Turni: {len(samples):>4}")
         except Exception as e:
@@ -327,21 +343,26 @@ def run_training(config: Dict[str, Any], logger: logging.Logger) -> None:
         logger.error("Nessun dato caricato. Interruzione.")
         sys.exit(1)
 
-    # Splitting a livello di conversazione (garantisce zero data leakage)
+    # Splitting conversazionale train/validation
     train_samples, val_samples = split_conversations_train_val(all_train_samples, val_ratio=0.15, seed=seed)
     logger.info(f"Campioni suddivisi: Train {len(train_samples)} | Val {len(val_samples)}")
 
+    # Istanziazione Dataset con passaggio degli Hard Negatives minati
     train_dataset = RETECO2aTrainDataset(
         samples=train_samples,
         corpus=combined_corpus,
         use_triplets=data_cfg.get("use_triplets", True),
         negatives_per_positive=data_cfg.get("negatives_per_positive", 1),
+        hard_negatives=combined_hard_negatives,
+        sampling_strategy=sampling_strat,
     )
     val_dataset = RETECO2aTrainDataset(
         samples=val_samples,
         corpus=combined_corpus,
         use_triplets=data_cfg.get("use_triplets", True),
         negatives_per_positive=1,
+        hard_negatives=combined_hard_negatives,
+        sampling_strategy="random",  # La validazione usa negativi random per monitorare la loss generale
     )
     logger.info(f"Istanze PyTorch create -> Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
@@ -350,6 +371,8 @@ def run_training(config: Dict[str, Any], logger: logging.Logger) -> None:
     # ---------------------------------------------------------
     model_name = bi_cfg.get("model_name_or_path", "BAAI/bge-base-en-v1.5")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     collate_fn = ConversationalCollateFn(
         tokenizer=tokenizer,
@@ -380,12 +403,16 @@ def run_training(config: Dict[str, Any], logger: logging.Logger) -> None:
         drop_last=False,
     )
 
-    logger.info(f"Inizializzazione Modello Bi-Encoder: {model_name}")
+    lora_cfg = config.get("lora", {})
+    logger.info(f"Inizializzazione Modello Bi-Encoder: {model_name} (LoRA: {lora_cfg.get('enabled', False)})")
+    
     model = ConversationalBiEncoder(
         model_name_or_path=model_name,
         temperature=bi_cfg.get("temperature", 0.05),
         normalize_embeddings=bi_cfg.get("normalize_embeddings", True),
         pooling_strategy=bi_cfg.get("pooling_strategy", "mean"),
+        lora_cfg=lora_cfg,
+        device=device,
     ).to(device)
 
     # ---------------------------------------------------------

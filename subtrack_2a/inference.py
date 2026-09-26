@@ -35,7 +35,6 @@ logger = logging.getLogger("RETECO_Eval")
 # ==============================================================================
 # 1. Motore Lessicale BM25 (Per Retrieval Ibrido)
 # ==============================================================================
-
 class SimpleBM25:
     """Calcolo lessicale BM25Okapi conforme ai parametri ufficiali (k1=0.9, b=0.4)."""
     def __init__(self, corpus: Dict[str, str], k1: float = 0.9, b: float = 0.4):
@@ -86,37 +85,80 @@ class SimpleBM25:
 # ==============================================================================
 # 2. Caricamento Modelli e Codifica Vettoriale
 # ==============================================================================
-
 def load_models(config: Dict[str, Any], device: torch.device):
-    """Carica i pesi del Bi-Encoder (da checkpoint locale o base HF) ed eventuale Cross-Encoder."""
+    """
+    Carica i pesi del Bi-Encoder (modello completo, LoRA adapter o base HF)
+    e inizializza l'eventuale Cross-Encoder per il re-ranking.
+    """
     paths_cfg = config.get("paths", {})
     bi_cfg = config.get("bi_encoder", {})
     cross_cfg = config.get("cross_encoder", {})
 
+    # 1. Risoluzione percorso checkpoint
     checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a"))
     if not checkpoint_dir.exists() and (Path("..") / checkpoint_dir).exists():
         checkpoint_dir = Path("..") / checkpoint_dir
 
     best_hf_path = checkpoint_dir / "best_hf_model"
-    model_source = str(best_hf_path) if best_hf_path.exists() else bi_cfg.get("model_name_or_path", "BAAI/bge-base-en-v1.5")
-    logger.info(f"Caricamento Bi-Encoder da: {model_source}")
+    base_model_name = bi_cfg.get("model_name_or_path", "BAAI/bge-base-en-v1.5")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_source)
-    bi_encoder = ConversationalBiEncoder(
-        model_name_or_path=model_source,
-        temperature=bi_cfg.get("temperature", 0.05),
-        normalize_embeddings=bi_cfg.get("normalize_embeddings", True),
-        pooling_strategy=bi_cfg.get("pooling_strategy", "mean"),
-    ).to(device)
+    # 2. Caricamento Tokenizer (predilige la cartella salvata se presente)
+    tok_source = str(best_hf_path) if (best_hf_path / "tokenizer_config.json").exists() else base_model_name
+    tokenizer = AutoTokenizer.from_pretrained(tok_source)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Parametri comuni del Bi-Encoder
+    bi_params = {
+        "temperature": float(bi_cfg.get("temperature", 0.05)),
+        "normalize_embeddings": bool(bi_cfg.get("normalize_embeddings", True)),
+        "pooling_strategy": bi_cfg.get("pooling_strategy", "mean"),
+    }
+
+    # 3. Caricamento Bi-Encoder
+    has_lora = (best_hf_path / "adapter_config.json").exists()
+    has_full_weights = (best_hf_path / "model.safetensors").exists() or (best_hf_path / "pytorch_model.bin").exists()
+
+    if has_lora:
+        logger.info(f"Caricamento Base Model ({base_model_name}) + LoRA Adapter da {best_hf_path}...")
+        try:
+            from peft import PeftModel
+        except ImportError:
+            raise ImportError("Rilevato adapter LoRA ma 'peft' non è installato. Esegui: pip install peft")
+
+        bi_encoder = ConversationalBiEncoder(
+            model_name_or_path=base_model_name,
+            **bi_params
+        ).to(device)
+        
+        bi_encoder.encoder = PeftModel.from_pretrained(bi_encoder.encoder, str(best_hf_path))
+        # Unione dei pesi LoRA nella backbone per eliminare l'overhead in inferenza
+        bi_encoder.encoder = bi_encoder.encoder.merge_and_unload()
+
+    elif has_full_weights:
+        logger.info(f"Caricamento Bi-Encoder completo da checkpoint locale: {best_hf_path}")
+        bi_encoder = ConversationalBiEncoder(
+            model_name_or_path=str(best_hf_path),
+            **bi_params
+        ).to(device)
+
+    else:
+        logger.info(f"Nessun checkpoint valido trovato in {best_hf_path}. Caricamento modello base: {base_model_name}")
+        bi_encoder = ConversationalBiEncoder(
+            model_name_or_path=base_model_name,
+            **bi_params
+        ).to(device)
+
     bi_encoder.eval()
 
+    # 4. Inizializzazione Cross-Encoder (Re-ranking neurale)
     cross_encoder = None
     if cross_cfg.get("enabled", False):
         reranker_name = cross_cfg.get("model_name_or_path", "BAAI/bge-reranker-base")
         logger.info(f"Caricamento Cross-Encoder per Re-ranking: {reranker_name}")
         cross_encoder = ConversationalCrossEncoder(
             model_name_or_path=reranker_name,
-            num_labels=cross_cfg.get("num_labels", 1),
+            num_labels=int(cross_cfg.get("num_labels", 1)),
         ).to(device)
         cross_encoder.eval()
 

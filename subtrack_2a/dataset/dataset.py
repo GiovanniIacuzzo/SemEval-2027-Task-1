@@ -2,15 +2,19 @@
 """
 subtrack_2a/dataset/dataset.py
 
-Modulo di gestione dei dati per RETECO Sub-track 2a (Conversational Retrieval).
-Supporta:
-  - Caricamento dei file benchmark_{train,dev}.json, documents.jsonl e qrels_{train,dev}.txt.
-  - Costruzione della query contestuale (risoluzione dello storico multi-turno).
-  - PyTorch Dataset per l'addestramento contrastivo (triplette query-positivo-negativo o in-batch negatives).
-  - PyTorch Dataset per l'indicizzazione e l'inferenza valutata con pytrec_eval.
+Modulo di gestione dati per SemEval-2027 RETECO Sub-track 2a (Conversational Retrieval).
+Funzionalità:
+  - Caricamento di benchmark_{train,dev}.json, documents.jsonl e qrels_{train,dev}.txt.
+  - Costruzione della query contestuale (cronologia + turno corrente).
+  - Indicizzazione lessicale BM25 e mining dei falsi positivi (Hard Negatives).
+  - PyTorch Train Dataset con supporto a 'bm25_hard', 'mixed' e 'random' sampling.
+  - PyTorch Inference/Corpus Dataset per la codifica vettoriale e la valutazione.
 """
 
 import os
+import sys
+import math
+import re
 import json
 import random
 from dataclasses import dataclass
@@ -35,6 +39,10 @@ TRACK2_DOMAINS = [
 ]
 
 
+# ==============================================================================
+# 1. Strutture Dati e Formattazione Query
+# ==============================================================================
+
 @dataclass
 class ConversationalTurnSample:
     """Rappresentazione unificata di un turno conversazionale."""
@@ -51,12 +59,7 @@ class ConversationalTurnSample:
 
 def format_contextual_query(query: str, history: str, strategy: str = "concat") -> str:
     """
-    Costruisce la rappresentazione della query integrando la cronologia del dialogo.
-    
-    Args:
-        query: Domanda del turno corrente.
-        history: Testo della conversazione precedente ('No previous conversation.' per il primo turno).
-        strategy: 'concat' (Cronologia + Domanda) o 'query_only' (solo domanda corrente).
+    Costruisce la query contestualizzata integrando la cronologia conversazionale.
     """
     if strategy == "query_only":
         return query.strip()
@@ -68,11 +71,12 @@ def format_contextual_query(query: str, history: str, strategy: str = "concat") 
     return f"{history_clean}\n\nCurrent Question: {query.strip()}"
 
 
+# ==============================================================================
+# 2. Caricamento File Corpus, Qrels e Benchmark
+# ==============================================================================
+
 def load_corpus(documents_path: Union[str, Path]) -> Dict[str, str]:
-    """
-    Carica documents.jsonl mappando l'identificativo al testo del passaggio.
-    Gestisce le variazioni di chiave ('doc_id' o 'id'; 'content' o 'text').
-    """
+    """Carica documents.jsonl mappando doc_id al testo del passaggio."""
     documents_path = Path(documents_path)
     if not documents_path.exists():
         raise FileNotFoundError(f"File corpus non trovato: {documents_path}")
@@ -87,16 +91,13 @@ def load_corpus(documents_path: Union[str, Path]) -> Dict[str, str]:
             doc_id = str(item.get("doc_id") or item.get("id"))
             text = item.get("content") or item.get("text") or ""
             if not doc_id:
-                raise ValueError(f"Record privo di id alla riga {line_idx} in {documents_path}")
+                raise ValueError(f"Record privo di identificativo alla riga {line_idx} in {documents_path}")
             corpus[doc_id] = text.strip()
     return corpus
 
 
 def load_qrels(qrels_path: Union[str, Path]) -> Dict[str, Dict[str, int]]:
-    """
-    Legge il file standard TREC qrels a 4 colonne: topic_id 0 doc_id relevance.
-    Restituisce: {topic_id: {doc_id: relevance}}
-    """
+    """Legge il file standard TREC qrels a 4 colonne: topic_id 0 doc_id relevance."""
     qrels_path = Path(qrels_path)
     if not qrels_path.exists():
         raise FileNotFoundError(f"File qrels non trovato: {qrels_path}")
@@ -116,10 +117,7 @@ def load_benchmark_conversations(
     domain: str,
     query_strategy: str = "concat",
 ) -> List[ConversationalTurnSample]:
-    """
-    Estrae tutti i singoli turni da benchmark_{train,dev}.json (o .jsonl).
-    Costruisce il topic_id ufficiale nel formato: <conversation_id>_turn_<turn_id>.
-    """
+    """Estrae i turni conversazionali costruendo il topic_id ufficiale (<conv_id>_turn_<turn_id>)."""
     benchmark_path = Path(benchmark_path)
     if not benchmark_path.exists():
         raise FileNotFoundError(f"File benchmark non trovato: {benchmark_path}")
@@ -130,17 +128,14 @@ def load_benchmark_conversations(
         if content.startswith("["):
             raw_data = json.loads(content)
         else:
-            # Gestione fallback per formati JSONL
             for line in content.splitlines():
-                line = line.strip()
-                if line:
+                if line.strip():
                     raw_data.append(json.loads(line))
 
     samples: List[ConversationalTurnSample] = []
     for conv in raw_data:
         conv_id = conv.get("id")
-        turns = conv.get("turns", [])
-        for turn in turns:
+        for turn in conv.get("turns", []):
             turn_id = turn.get("turn_id")
             topic_id = f"{conv_id}_turn_{turn_id}"
             query = turn.get("query", "")
@@ -170,11 +165,116 @@ def load_benchmark_conversations(
     return samples
 
 
+# ==============================================================================
+# 3. Motore BM25 e Mining degli Hard Negatives
+# ==============================================================================
+
+class SimpleBM25:
+    """Implementazione BM25Okapi compatta conforme ai parametri ufficiali RETECO."""
+
+    def __init__(self, corpus: Dict[str, str], k1: float = 0.9, b: float = 0.4):
+        self.k1 = k1
+        self.b = b
+        self.doc_ids = list(corpus.keys())
+        self.corpus_size = len(self.doc_ids)
+
+        self.doc_len: Dict[str, int] = {}
+        self.doc_freqs: Dict[str, int] = {}
+        self.term_freqs: Dict[str, Dict[str, int]] = {}
+
+        total_length = 0
+        for doc_id, text in corpus.items():
+            tokens = self._tokenize(text)
+            t_len = len(tokens)
+            self.doc_len[doc_id] = t_len
+            total_length += t_len
+
+            tf: Dict[str, int] = {}
+            for t in tokens:
+                tf[t] = tf.get(t, 0) + 1
+            self.term_freqs[doc_id] = tf
+
+            for t in tf.keys():
+                self.doc_freqs[t] = self.doc_freqs.get(t, 0) + 1
+
+        self.avg_doc_len = (total_length / self.corpus_size) if self.corpus_size > 0 else 1.0
+
+        self.idf: Dict[str, float] = {}
+        for term, df in self.doc_freqs.items():
+            self.idf[term] = math.log(1.0 + (self.corpus_size - df + 0.5) / (df + 0.5))
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return re.findall(r"\b\w+\b", text.lower())
+
+    def get_top_k(self, query: str, top_k: int = 50) -> List[Tuple[str, float]]:
+        tokens = self._tokenize(query)
+        if not tokens:
+            return []
+
+        scores: Dict[str, float] = {}
+        for token in tokens:
+            if token not in self.idf:
+                continue
+            idf_val = self.idf[token]
+
+            for doc_id in self.doc_ids:
+                tf = self.term_freqs[doc_id].get(token, 0)
+                if tf > 0:
+                    num = tf * (self.k1 + 1.0)
+                    den = tf + self.k1 * (1.0 - self.b + self.b * (self.doc_len[doc_id] / self.avg_doc_len))
+                    scores[doc_id] = scores.get(doc_id, 0.0) + (idf_val * (num / den))
+
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+
+def mine_domain_bm25_hard_negatives(
+    corpus: Dict[str, str],
+    samples: List[ConversationalTurnSample],
+    top_k: int = 50,
+    k1: float = 0.9,
+    b: float = 0.4,
+    domain_prefix: Optional[str] = None,
+) -> Dict[str, List[str]]:
+    """
+    Estrae per ciascun turno i falsi positivi lessicali di BM25 escludendo rigorosamente i gold document.
+    Restituisce: {topic_id: [hard_neg_doc_id_1, hard_neg_doc_id_2, ...]}
+    """
+    bm25 = SimpleBM25(corpus, k1=k1, b=b)
+    hard_negatives_map: Dict[str, List[str]] = {}
+
+    for s in samples:
+        # Recupera un margine di candidati per compensare i passaggi gold estratti
+        candidates = bm25.get_top_k(s.contextual_query, top_k=top_k + len(s.gold_doc_ids) + 5)
+
+        gold_set = set(s.gold_doc_ids)
+        if domain_prefix:
+            gold_set.update(f"{domain_prefix}_{gid}" for gid in s.gold_doc_ids)
+
+        extracted = []
+        for doc_id, score in candidates:
+            if score <= 0.0:
+                continue
+
+            target_id = f"{domain_prefix}_{doc_id}" if domain_prefix and not doc_id.startswith(f"{domain_prefix}_") else doc_id
+
+            if doc_id not in gold_set and target_id not in gold_set:
+                extracted.append(target_id)
+                if len(extracted) >= top_k:
+                    break
+
+        hard_negatives_map[s.topic_id] = extracted
+
+    return hard_negatives_map
+
+
+# ==============================================================================
+# 4. PyTorch Datasets
+# ==============================================================================
+
 class RETECO2aTrainDataset(Dataset):
     """
-    Dataset PyTorch per l'addestramento contrastivo su Sub-track 2a.
-    Per ogni turno con documenti gold noti genera coppie (query, positivo) o
-    triplette (query, positivo, negativo casuale o hard negative).
+    Dataset PyTorch per l'addestramento contrastivo con supporto a Hard Negatives.
     """
 
     def __init__(
@@ -183,21 +283,25 @@ class RETECO2aTrainDataset(Dataset):
         corpus: Dict[str, str],
         use_triplets: bool = True,
         negatives_per_positive: int = 1,
+        hard_negatives: Optional[Dict[str, List[str]]] = None,
+        sampling_strategy: str = "bm25_hard",
     ):
         self.corpus = corpus
         self.corpus_keys = list(corpus.keys())
         self.use_triplets = use_triplets
         self.negatives_per_positive = negatives_per_positive
+        self.hard_negatives = hard_negatives or {}
+        self.sampling_strategy = sampling_strategy
 
-        # Filtra ed espande i campioni validi (che hanno almeno un gold presente nel corpus)
-        self.instances: List[Tuple[str, str, List[str]]] = []
+        # Tupla: (topic_id, contextual_query, pos_id, valid_gold_ids)
+        self.instances: List[Tuple[str, str, str, List[str]]] = []
         for sample in samples:
             valid_gold_ids = [gid for gid in sample.gold_doc_ids if gid in self.corpus]
             if not valid_gold_ids:
                 continue
 
             for gold_id in valid_gold_ids:
-                self.instances.append((sample.contextual_query, gold_id, valid_gold_ids))
+                self.instances.append((sample.topic_id, sample.contextual_query, gold_id, valid_gold_ids))
 
         if not self.instances:
             raise ValueError("Nessuna istanza di training valida trovata con i documenti presenti nel corpus.")
@@ -206,7 +310,7 @@ class RETECO2aTrainDataset(Dataset):
         return len(self.instances)
 
     def __getitem__(self, idx: int) -> Dict[str, str]:
-        contextual_query, pos_id, all_gold_ids = self.instances[idx]
+        topic_id, contextual_query, pos_id, all_gold_ids = self.instances[idx]
         pos_text = self.corpus[pos_id]
 
         if not self.use_triplets:
@@ -216,12 +320,30 @@ class RETECO2aTrainDataset(Dataset):
                 "pos_id": pos_id,
             }
 
-        # Campionamento di un negativo casuale dal corpus escludendo i gold noti
         gold_set = set(all_gold_ids)
-        while True:
-            neg_id = random.choice(self.corpus_keys)
-            if neg_id not in gold_set:
-                break
+        neg_id = None
+
+        # Selezione strategia di campionamento
+        use_hard = False
+        if self.sampling_strategy == "bm25_hard":
+            use_hard = True
+        elif self.sampling_strategy == "mixed":
+            use_hard = random.random() < 0.5
+
+        if use_hard and topic_id in self.hard_negatives:
+            # Considera solo i candidati presenti nel corpus ed esclude i gold
+            cands = [nid for nid in self.hard_negatives[topic_id] if nid in self.corpus and nid not in gold_set]
+            if cands:
+                neg_id = random.choice(cands)
+
+        # Fallback deterministico su negativo casuale
+        if neg_id is None:
+            while True:
+                candidate = random.choice(self.corpus_keys)
+                if candidate not in gold_set:
+                    neg_id = candidate
+                    break
+
         neg_text = self.corpus[neg_id]
 
         return {
@@ -234,10 +356,7 @@ class RETECO2aTrainDataset(Dataset):
 
 
 class RETECO2aInferenceDataset(Dataset):
-    """
-    Dataset per l'inferenza di retrieval o re-ranking.
-    Restituisce le query contestuali e i metadati associati a ciascun turno.
-    """
+    """Dataset per l'inferenza di retrieval o re-ranking."""
 
     def __init__(self, samples: List[ConversationalTurnSample]):
         self.samples = samples
@@ -257,9 +376,7 @@ class RETECO2aInferenceDataset(Dataset):
 
 
 class RETECO2aCorpusDataset(Dataset):
-    """
-    Dataset per l'indicizzazione densa del corpus dei documenti di un dominio.
-    """
+    """Dataset per l'indicizzazione densa del corpus dei documenti."""
 
     def __init__(self, corpus: Dict[str, str]):
         self.doc_ids = list(corpus.keys())
@@ -276,19 +393,19 @@ class RETECO2aCorpusDataset(Dataset):
         }
 
 
+# ==============================================================================
+# 5. Helper di Caricamento e Splitting
+# ==============================================================================
+
 def load_track2_domain_data(
     data_dir: Union[str, Path],
     domain: str,
     split: str = "train",
     query_strategy: str = "concat",
 ) -> Tuple[Dict[str, str], List[ConversationalTurnSample], Optional[Dict[str, Dict[str, int]]]]:
-    """
-    Carica corpus, benchmark turni e qrels per un dominio specifico.
-    Risolve automaticamente i percorsi sia eseguendo dalla radice che da dentro subtrack_2a/.
-    """
+    """Carica i dati di un dominio risolvendo automaticamente i percorsi relativi."""
     p = Path(data_dir)
 
-    # Lista di possibili percorsi per individuare la cartella del dominio
     candidate_paths = [
         p / domain,
         p / "track2_recor" / domain,
@@ -300,7 +417,6 @@ def load_track2_domain_data(
 
     domain_dir = None
     for cand in candidate_paths:
-        # Verifica se la cartella esiste e contiene documents.jsonl
         if cand.exists() and (cand / "documents.jsonl").exists():
             domain_dir = cand.resolve()
             break
@@ -314,7 +430,6 @@ def load_track2_domain_data(
     corpus_path = domain_dir / "documents.jsonl"
     corpus = load_corpus(corpus_path)
 
-    # Identificazione file benchmark
     benchmark_candidates = [
         domain_dir / f"benchmark_{split}.json",
         domain_dir / f"benchmark_{split}.jsonl",
@@ -327,7 +442,6 @@ def load_track2_domain_data(
 
     samples = load_benchmark_conversations(benchmark_path, domain=domain, query_strategy=query_strategy)
 
-    # Identificazione file qrels
     qrels_candidates = [
         domain_dir / f"qrels_{split}.txt",
         domain_dir / "qrels.txt",
@@ -337,15 +451,13 @@ def load_track2_domain_data(
 
     return corpus, samples, qrels
 
+
 def split_conversations_train_val(
     samples: List[ConversationalTurnSample],
     val_ratio: float = 0.15,
     seed: int = 42,
 ) -> Tuple[List[ConversationalTurnSample], List[ConversationalTurnSample]]:
-    """
-    Suddivide i campioni in train e validation a livello di intera conversazione,
-    garantendo che nessun turno pregresso finisca nel validation split.
-    """
+    """Suddivide in train e validation per intera conversazione (zero data leakage)."""
     conv_ids = sorted(list(set(s.conversation_id for s in samples)))
     rng = random.Random(seed)
     rng.shuffle(conv_ids)
@@ -359,53 +471,44 @@ def split_conversations_train_val(
     return train_samples, val_samples
 
 
+# ==============================================================================
+# 6. Test di Verifica
+# ==============================================================================
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Test rapido del modulo dataset per Sub-track 2a.")
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="data/sample/track2_recor",
-        help="Percorso ai dati di Track 2 (sample o completi).",
-    )
-    parser.add_argument(
-        "--domain",
-        type=str,
-        default="drones",
-        help="Nome del dominio di prova (es. 'drones', 'biology').",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="train",
-        help="Split da caricare ('train' o 'dev').",
-    )
-
+    parser = argparse.ArgumentParser(description="Test modulo dataset con BM25 Hard Negatives.")
+    parser.add_argument("--data_dir", type=str, default="data/reteco_data/track2_recor", help="Directory dei dati")
+    parser.add_argument("--domain", type=str, default="drones", help="Dominio di test")
+    parser.add_argument("--split", type=str, default="train", help="Split (train o dev)")
     args = parser.parse_args()
-    print(f"Verifica caricamento dataset su dominio '{args.domain}' da {args.data_dir}...")
 
+    print(f"Test su dominio '{args.domain}' da '{args.data_dir}'...")
     try:
-        loaded_corpus, loaded_samples, loaded_qrels = load_track2_domain_data(
-            data_dir=args.data_dir,
-            domain=args.domain,
-            split=args.split,
+        corpus, samples, qrels = load_track2_domain_data(args.data_dir, args.domain, split=args.split)
+        print(f"✓ Corpus: {len(corpus):,} passaggi | Turni: {len(samples)}")
+
+        print("\nEstrazione Hard Negatives tramite BM25...")
+        hard_negs = mine_domain_bm25_hard_negatives(corpus, samples, top_k=20)
+        avg_negs = sum(len(v) for v in hard_negs.values()) / max(1, len(hard_negs))
+        print(f"✓ Hard Negatives minati: media di {avg_negs:.1f} passaggi per query.")
+
+        ds = RETECO2aTrainDataset(
+            samples=samples,
+            corpus=corpus,
+            hard_negatives=hard_negs,
+            sampling_strategy="bm25_hard",
         )
+        print(f"✓ Dataset PyTorch inizializzato ({len(ds)} istanze).")
 
-        print(f"✓ Corpus caricato: {len(loaded_corpus)} documenti.")
-        print(f"✓ Turni conversazionali estratti: {len(loaded_samples)}.")
-        if loaded_qrels:
-            print(f"✓ Qrels caricati: {len(loaded_qrels)} topic annotati.")
-
-        train_ds = RETECO2aTrainDataset(samples=loaded_samples, corpus=loaded_corpus, use_triplets=True)
-        print(f"✓ Dataset PyTorch istanziato con successo. Numero istanze di training: {len(train_ds)}.")
-
-        first_sample = train_ds[0]
-        print("\nEsempio prima istanza:")
-        print(f"  [Query Contestuale]: {first_sample['query'][:120]}...")
-        print(f"  [Positivo ID]: {first_sample['pos_id']}")
-        print(f"  [Positivo Testo]: {first_sample['positive'][:100]}...")
-        print(f"  [Negativo ID]: {first_sample['neg_id']}")
+        item = ds[0]
+        print("\n--- Esempio Triplette Minata ---")
+        print(f"Query:        {item['query'][:100]}...")
+        print(f"Positivo ID:  {item['pos_id']}")
+        print(f"Positivo:     {item['positive'][:90]}...")
+        print(f"Negativo ID:  {item['neg_id']}")
+        print(f"Hard Neg:     {item['negative'][:90]}...")
 
     except Exception as e:
-        print(f"Nota/Errore: {e}")
+        print(f"Errore/Nota: {e}")

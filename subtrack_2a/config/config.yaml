@@ -27,7 +27,7 @@ data:
   pin_memory: false
   use_triplets: true
   negatives_per_positive: 1
-  negative_sampling_strategy: "random"
+  negative_sampling_strategy: "bm25_hard"
 
 bi_encoder:
   model_name_or_path: "BAAI/bge-base-en-v1.5"
@@ -37,8 +37,8 @@ bi_encoder:
   max_seq_length: 128
 
 cross_encoder:
-  enabled: false
-  model_name_or_path: "BAAI/bge-reranker-base"
+  enabled: true
+  model_name_or_path: "BAAI/bge-reranker-base" # model_name_or_path: "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
   max_seq_length: 128
   num_labels: 1
   batch_size: 16
@@ -55,17 +55,26 @@ hybrid_fusion:
   top_candidates_to_rerank: 50
 
 training:
-  epochs: 1
+  epochs: 2
   batch_size: 8
-  learning_rate: 2.0e-5
+  learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.1
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   save_best_only: true
   monitor_metric: "val_loss"
-  early_stopping_patience: 1
+  early_stopping_patience: 2
   log_every_n_steps: 5
+
+lora:
+  enabled: true
+  use_qlora_4bit: false
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: "auto"
+  bias: "none"
 
 evaluation:
   split: "dev"
