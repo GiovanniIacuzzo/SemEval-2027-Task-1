@@ -1,103 +1,92 @@
 general:
   seed: 42
-  run_tag: "mac_smoke_test"
-  device: "auto"
-  mixed_precision: false
+  run_tag: "reteco_2a_t4_competitive"
+  device: "auto"                    # 'auto', 'cuda', 'mps', 'cpu'
+  mixed_precision: true             # AMP FP16 nativo su CUDA (disabilitato su CPU/MPS)
   logging_level: "INFO"
 
 paths:
-  data_mode: "full"
+  data_mode: "full"                 # 'sample' o 'full'
   full_data_dir: "data/reteco_data/track2_recor"
   sample_data_dir: "data/sample/track2_recor"
-  checkpoint_dir: "checkpoints/subtrack_2a"
+  checkpoint_dir: "checkpoints/subtrack_2a/bi_encoder"
   output_dir: "outputs/subtrack_2a"
   log_dir: "outputs/subtrack_2a/logs"
+  embedding_cache_dir: "data/cache/document_embeddings"
+  hard_negatives_cache_dir: "data/cache/hard_negatives"
   dev_run_file: "outputs/subtrack_2a/dev_run.trec"
   submission_file: "outputs/subtrack_2a/submission_2a.trec"
 
 domains:
-  active_domains:
-    - "drones"
+  # "all" per tutti gli 11 domini o lista esplicita (es. ["drones", "biology"])
+  active_domains: ["drones"]
+  domain_balanced_training: true    # Uniforma il peso dei domini durante il training
 
 data:
-  query_strategy: "concat"
-  max_query_length: 128
-  max_doc_length: 128
-  num_workers: 0
-  pin_memory: false
+  query_strategy: "budget_context"  # 'budget_context' (riserva token), 'query_only', 'concat'
+  max_query_length: 256             # Budget totale query (T4 friendly)
+  max_doc_length: 256               # Budget documenti
+  num_workers: 2
+  pin_memory: true
   use_triplets: true
-  negatives_per_positive: 1
-  negative_sampling_strategy: "bm25_hard"
+  negatives_per_positive: 1         # Default competitivo: 4 hard negatives per positivo
+  negative_sampling_strategy: "bm25_hard" # 'bm25_hard', 'mixed', 'random'
+  val_ratio: 0.15                   # Split interno basato su conversazioni intere
 
 bi_encoder:
   model_name_or_path: "BAAI/bge-base-en-v1.5"
-  pooling_strategy: "mean"
+  max_seq_length: 256
+  pooling_strategy: "mean"          # 'mean' oppure 'cls'
   normalize_embeddings: true
   temperature: 0.05
-  max_seq_length: 128
+  query_instruction:
+    enabled: true                   # Istruzione ufficiale BGE
+    text: "Represent this sentence for searching relevant passages: "
 
 cross_encoder:
-  enabled: true
-  model_name_or_path: "BAAI/bge-reranker-base" # model_name_or_path: "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-  max_seq_length: 128
-  num_labels: 1
-  batch_size: 16
+  enabled: false
+  trainable: false                  # Se true, esegue il training del cross-encoder
+  model_name_or_path: "BAAI/bge-reranker-base"
+  checkpoint_dir: "checkpoints/subtrack_2a/cross_encoder"
+  max_seq_length: 384               # Finestra di contesto estesa per T4
+  batch_size: 16                    # Batch inference/train per il reranker
+  use_lora: true
 
 sparse:
   enabled: true
   k1: 0.9
   b: 0.4
-  top_k_candidates: 50
+  top_k_candidates: 100             # Esteso a 100 candidati
 
 hybrid_fusion:
   enabled: true
-  rrf_k: 60
-  top_candidates_to_rerank: 50
-
-training:
-  epochs: 2
-  batch_size: 8
-  learning_rate: 1.0e-4
-  weight_decay: 0.01
-  warmup_ratio: 0.1
-  gradient_accumulation_steps: 1
-  max_grad_norm: 1.0
-  save_best_only: true
-  monitor_metric: "val_loss"
-  early_stopping_patience: 2
-  log_every_n_steps: 5
+  rrf_k: 60                         # Ablabile su [10, 30, 60, 100]
+  top_candidates_to_rerank: 100     # Passa 100 candidati al cross-encoder
 
 lora:
   enabled: true
-  use_qlora_4bit: false
+  use_qlora_4bit: false             # false per BGE 110M su T4; true per LLM 7B/8B
   r: 16
   lora_alpha: 32
   lora_dropout: 0.05
   target_modules: "auto"
   bias: "none"
 
+training:
+  epochs: 3
+  batch_size: 4                     # Ideale per sequenze a 256 token su T4 16GB
+  learning_rate: 1.0e-4             # LR per LoRA
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 2    # Batch size effettivo = 16
+  max_grad_norm: 1.0
+  monitor_metric: "val_ndcg@10"     # Metrica di selezione: 'val_ndcg@10' o 'val_loss'
+  early_stopping_patience: 2
+  log_every_n_steps: 10
+
 evaluation:
-  split: "dev"
-  eval_batch_size: 32
-  official_metric: "ndcg_cut_10"
+  split: "dev"                      # Usato solo per misura finale held-out
+  eval_batch_size: 128
   cutoff_k: 10
+  official_metric: "ndcg_cut_10"
   save_json_results: true
-
-submission:
-  target_split: "dev"
-  run_tag: "SMOKE_TEST_2A"
-  max_rank_per_query: 10
-  strict_validation: true
-
-
-huggingface:
-  repo_name: "reteco-2a-bge-base"
-  model_dir: "checkpoints/subtrack_2a/best_hf_model"  
-  private: true
-  create_model_card: true
-  commit_message: "Upload checkpoint addestrato per SemEval-2027 Sub-track 2a (RECOR)"  
-  ignore_patterns:
-    - "*.DS_Store"
-    - "*.log"
-    - "*.tmp"
-    - "__pycache__/*"

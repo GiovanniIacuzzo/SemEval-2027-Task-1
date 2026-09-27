@@ -2,342 +2,509 @@
 """
 subtrack_2a/inference.py
 
-Script di VALUTAZIONE OFFLINE per RETECO Sub-track 2a.
-Scopo:
-  - Recuperare i documenti per ogni turno dello split con etichette ('dev' o 'train').
-  - Confrontare i documenti estratti con i gold labels (qrels_*.txt) tramite pytrec_eval.
-  - Stampare a terminale una tabella riassuntiva con nDCG@10 per ciascun dominio e la macro-media.
-  - Salvare una bozza dei risultati in formato JSON (evaluation_results.json).
+Pipeline di Inferenza, Diagnostica e Ablation per SemEval-2027 Sub-track 2a.
+Caratteristiche:
+  - Risolto bug di inizializzazione logger (compatibilità con setup_logger).
+  - Cache persistente su disco per Document Embeddings con hash di consistenza.
+  - Diagnostica retrieval esaustiva a 4 stadi (Dense, BM25, RRF, Cross-Encoder).
+  - Candidati espansi (Top 100) e RRF configurabile (k=10, 30, 60, 100).
+  - Supporto accelerazione hardware (MPS per Mac, CUDA FP16 per GPU T4).
+  - Supporto per Reranker pretrained e fine-tuned.
+  - Ablation automatiche da riga di comando (A..G).
 """
 
 import os
 import sys
 import time
 import math
-import re
+import json
+import hashlib
 import logging
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer
+from tqdm import tqdm
 
-from dataset.dataset import load_track2_domain_data, TRACK2_DOMAINS
+from dataset.dataset import (
+    TRACK2_DOMAINS,
+    OfficialCompatibleBM25,
+    ContextAwareQueryFormatter,
+    load_track2_domain_data,
+)
 from models.model import ConversationalBiEncoder, ConversationalCrossEncoder
-from utils.utils import load_config, save_json, compute_official_ndcg, reciprocal_rank_fusion
+from utils.utils import (
+    load_config,
+    save_json,
+    compute_official_ndcg,
+    reciprocal_rank_fusion,
+    write_trec_run,
+    validate_trec_file,
+    setup_logger,
+)
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)-8s] %(message)s")
-logger = logging.getLogger("RETECO_Eval")
-
-
-# ==============================================================================
-# 1. Motore Lessicale BM25 (Per Retrieval Ibrido)
-# ==============================================================================
-class SimpleBM25:
-    """Calcolo lessicale BM25Okapi conforme ai parametri ufficiali (k1=0.9, b=0.4)."""
-    def __init__(self, corpus: Dict[str, str], k1: float = 0.9, b: float = 0.4):
-        self.k1 = k1
-        self.b = b
-        self.doc_ids = list(corpus.keys())
-        self.corpus_size = len(self.doc_ids)
-        self.doc_len: Dict[str, int] = {}
-        self.doc_freqs: Dict[str, int] = {}
-        self.term_freqs: Dict[str, Dict[str, int]] = {}
-
-        total_length = 0
-        for doc_id, text in corpus.items():
-            tokens = re.findall(r"\b\w+\b", text.lower())
-            self.doc_len[doc_id] = len(tokens)
-            total_length += len(tokens)
-            tf: Dict[str, int] = {}
-            for t in tokens:
-                tf[t] = tf.get(t, 0) + 1
-            self.term_freqs[doc_id] = tf
-            for t in tf.keys():
-                self.doc_freqs[t] = self.doc_freqs.get(t, 0) + 1
-
-        self.avg_doc_len = (total_length / self.corpus_size) if self.corpus_size > 0 else 1.0
-        self.idf: Dict[str, float] = {
-            t: math.log(1.0 + (self.corpus_size - df + 0.5) / (df + 0.5))
-            for t, df in self.doc_freqs.items()
-        }
-
-    def get_top_k(self, query: str, top_k: int = 100) -> List[Tuple[str, float]]:
-        tokens = re.findall(r"\b\w+\b", query.lower())
-        if not tokens:
-            return []
-        scores: Dict[str, float] = {}
-        for token in tokens:
-            if token not in self.idf:
-                continue
-            idf_val = self.idf[token]
-            for doc_id in self.doc_ids:
-                tf = self.term_freqs[doc_id].get(token, 0)
-                if tf > 0:
-                    num = tf * (self.k1 + 1.0)
-                    den = tf + self.k1 * (1.0 - self.b + self.b * (self.doc_len[doc_id] / self.avg_doc_len))
-                    scores[doc_id] = scores.get(doc_id, 0.0) + (idf_val * (num / den))
-        return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+# Logger base globale a console per evitare errori di import preliminari
+logger = logging.getLogger("RETECO_Inference")
+if not logger.handlers:
+    _ch = logging.StreamHandler(sys.stdout)
+    _ch.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)-8s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(_ch)
+    logger.setLevel(logging.INFO)
 
 
 # ==============================================================================
-# 2. Caricamento Modelli e Codifica Vettoriale
+# 1. Gestore della Cache degli Embedding Documentali
 # ==============================================================================
-def load_models(config: Dict[str, Any], device: torch.device):
-    """
-    Carica i pesi del Bi-Encoder (modello completo, LoRA adapter o base HF)
-    e inizializza l'eventuale Cross-Encoder per il re-ranking.
-    """
-    paths_cfg = config.get("paths", {})
-    bi_cfg = config.get("bi_encoder", {})
-    cross_cfg = config.get("cross_encoder", {})
 
-    # 1. Risoluzione percorso checkpoint
-    checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a"))
-    if not checkpoint_dir.exists() and (Path("..") / checkpoint_dir).exists():
-        checkpoint_dir = Path("..") / checkpoint_dir
+class DocumentEmbeddingCache:
+    """Gestisce la memorizzazione su disco degli embedding del corpus con controllo di consistenza."""
 
-    best_hf_path = checkpoint_dir / "best_hf_model"
-    base_model_name = bi_cfg.get("model_name_or_path", "BAAI/bge-base-en-v1.5")
+    def __init__(self, cache_dir: Path, model_tag: str, pooling: str, max_len: int):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.model_tag = model_tag
+        self.pooling = pooling
+        self.max_len = max_len
 
-    # 2. Caricamento Tokenizer (predilige la cartella salvata se presente)
-    tok_source = str(best_hf_path) if (best_hf_path / "tokenizer_config.json").exists() else base_model_name
-    tokenizer = AutoTokenizer.from_pretrained(tok_source)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    def _get_hash_key(self, domain: str, corpus_size: int) -> str:
+        key_str = f"{self.model_tag}_{self.pooling}_{self.max_len}_{domain}_{corpus_size}"
+        return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
 
-    # Parametri comuni del Bi-Encoder
-    bi_params = {
-        "temperature": float(bi_cfg.get("temperature", 0.05)),
-        "normalize_embeddings": bool(bi_cfg.get("normalize_embeddings", True)),
-        "pooling_strategy": bi_cfg.get("pooling_strategy", "mean"),
+    def load(self, domain: str, corpus_size: int) -> Optional[Tuple[torch.Tensor, List[str]]]:
+        hash_key = self._get_hash_key(domain, corpus_size)
+        emb_file = self.cache_dir / f"embs_{domain}_{hash_key}.pt"
+        meta_file = self.cache_dir / f"meta_{domain}_{hash_key}.json"
+
+        if emb_file.exists() and meta_file.exists():
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("corpus_size") == corpus_size and meta.get("max_len") == self.max_len:
+                    logger.info(f"✓ Cache trovata per [{domain}] ({corpus_size} docs). Caricamento immediato...")
+                    data = torch.load(emb_file, map_location="cpu")
+                    return data["embeddings"], data["doc_ids"]
+            except Exception as e:
+                logger.warning(f"Errore lettura cache per {domain}: {e}. Ricalcolo...")
+        return None
+
+    def save(self, domain: str, embeddings: torch.Tensor, doc_ids: List[str]):
+        hash_key = self._get_hash_key(domain, len(doc_ids))
+        emb_file = self.cache_dir / f"embs_{domain}_{hash_key}.pt"
+        meta_file = self.cache_dir / f"meta_{domain}_{hash_key}.json"
+
+        try:
+            torch.save({"embeddings": embeddings.cpu(), "doc_ids": doc_ids}, emb_file)
+            with open(meta_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "domain": domain,
+                    "corpus_size": len(doc_ids),
+                    "model_tag": self.model_tag,
+                    "pooling": self.pooling,
+                    "max_len": self.max_len,
+                    "timestamp": time.time(),
+                }, f)
+            logger.info(f"✓ Embeddings per [{domain}] salvati in cache: {emb_file.name}")
+        except Exception as e:
+            logger.warning(f"Salvataggio cache non riuscito: {e}")
+
+
+# ==============================================================================
+# 2. Calcolo Metriche Diagnostiche
+# ==============================================================================
+
+def compute_detailed_metrics(
+    qrels: Dict[str, Dict[str, int]],
+    run: Dict[str, List[Tuple[str, float]]],
+    cutoff_k: int = 10,
+) -> Dict[str, float]:
+    """Calcola nDCG@10, Recall@10, Recall@50, Recall@100 e MRR su una singola run."""
+    trec_format = {t_id: {d_id: sc for d_id, sc in docs} for t_id, docs in run.items()}
+    official = compute_official_ndcg(qrels, trec_format, cutoff=cutoff_k)
+
+    recalls = {10: [], 50: [], 100: []}
+    mrrs = []
+
+    for t_id, q_golds in qrels.items():
+        if t_id not in run:
+            continue
+        ranked = [d_id for d_id, _ in run[t_id]]
+        golds = set(q_golds.keys())
+
+        for k in [10, 50, 100]:
+            hits = len(set(ranked[:k]).intersection(golds))
+            recalls[k].append(hits / max(1, len(golds)))
+
+        rr = 0.0
+        for rank_idx, d_id in enumerate(ranked, 1):
+            if d_id in golds:
+                rr = 1.0 / rank_idx
+                break
+        mrrs.append(rr)
+
+    return {
+        f"nDCG@{cutoff_k}": official.get(f"ndcg_cut_{cutoff_k}", 0.0),
+        "Recall@10": float(np.mean(recalls[10])) if recalls[10] else 0.0,
+        "Recall@50": float(np.mean(recalls[50])) if recalls[50] else 0.0,
+        "Recall@100": float(np.mean(recalls[100])) if recalls[100] else 0.0,
+        "MRR": float(np.mean(mrrs)) if mrrs else 0.0,
     }
 
-    # 3. Caricamento Bi-Encoder
-    has_lora = (best_hf_path / "adapter_config.json").exists()
-    has_full_weights = (best_hf_path / "model.safetensors").exists() or (best_hf_path / "pytorch_model.bin").exists()
-
-    if has_lora:
-        logger.info(f"Caricamento Base Model ({base_model_name}) + LoRA Adapter da {best_hf_path}...")
-        try:
-            from peft import PeftModel
-        except ImportError:
-            raise ImportError("Rilevato adapter LoRA ma 'peft' non è installato. Esegui: pip install peft")
-
-        bi_encoder = ConversationalBiEncoder(
-            model_name_or_path=base_model_name,
-            **bi_params
-        ).to(device)
-        
-        bi_encoder.encoder = PeftModel.from_pretrained(bi_encoder.encoder, str(best_hf_path))
-        # Unione dei pesi LoRA nella backbone per eliminare l'overhead in inferenza
-        bi_encoder.encoder = bi_encoder.encoder.merge_and_unload()
-
-    elif has_full_weights:
-        logger.info(f"Caricamento Bi-Encoder completo da checkpoint locale: {best_hf_path}")
-        bi_encoder = ConversationalBiEncoder(
-            model_name_or_path=str(best_hf_path),
-            **bi_params
-        ).to(device)
-
-    else:
-        logger.info(f"Nessun checkpoint valido trovato in {best_hf_path}. Caricamento modello base: {base_model_name}")
-        bi_encoder = ConversationalBiEncoder(
-            model_name_or_path=base_model_name,
-            **bi_params
-        ).to(device)
-
-    bi_encoder.eval()
-
-    # 4. Inizializzazione Cross-Encoder (Re-ranking neurale)
-    cross_encoder = None
-    if cross_cfg.get("enabled", False):
-        reranker_name = cross_cfg.get("model_name_or_path", "BAAI/bge-reranker-base")
-        logger.info(f"Caricamento Cross-Encoder per Re-ranking: {reranker_name}")
-        cross_encoder = ConversationalCrossEncoder(
-            model_name_or_path=reranker_name,
-            num_labels=int(cross_cfg.get("num_labels", 1)),
-        ).to(device)
-        cross_encoder.eval()
-
-    return bi_encoder, tokenizer, cross_encoder
-
-
-def encode_texts(texts: List[str], tokenizer, model, device: torch.device, batch_size: int = 64, max_len: int = 512, use_amp: bool = False) -> torch.Tensor:
-    """Codifica a batch vettori densi normalizzati (L2)."""
-    model.eval()
-    all_embs = []
-    with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
-            inputs = tokenizer(batch_texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt").to(device)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                embs = model.encode(inputs["input_ids"], inputs["attention_mask"], inputs.get("token_type_ids"))
-            all_embs.append(embs.cpu())
-    return torch.cat(all_embs, dim=0)
-
 
 # ==============================================================================
-# 3. Pipeline di Valutazione Offline
+# 3. Pipeline Principale di Inferenza
 # ==============================================================================
 
-def evaluate_offline(config: Dict[str, Any], split: str = "dev"):
+def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Optional[str] = None):
     gen_cfg = config.get("general", {})
     paths_cfg = config.get("paths", {})
     dom_cfg = config.get("domains", {})
     data_cfg = config.get("data", {})
     eval_cfg = config.get("evaluation", {})
+    bi_cfg = config.get("bi_encoder", {})
     sparse_cfg = config.get("sparse", {})
     hybrid_cfg = config.get("hybrid_fusion", {})
     cross_cfg = config.get("cross_encoder", {})
+    lora_cfg = config.get("lora", {})
 
-    # Dispositivo
-    device_pref = gen_cfg.get("device", "auto")
-    if device_pref == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
+    # Gestione Ablation Flags (A-G)
+    query_strategy = data_cfg.get("query_strategy", "budget_context")
+    use_dense_checkpoint = True
+    use_cross_encoder = cross_cfg.get("enabled", True)
+    use_cross_finetuned = False
+
+    if ablation_mode == "A":
+        logger.info(">>> Modalità Ablation A: BM25 Current-Turn Only <<<")
+        query_strategy = "query_only"
+        use_cross_encoder = False
+    elif ablation_mode == "B":
+        logger.info(">>> Modalità Ablation B: BM25 con Cronologia <<<")
+        use_cross_encoder = False
+    elif ablation_mode == "C":
+        logger.info(">>> Modalità Ablation C: Dense Pretrained (No Fine-tuning) <<<")
+        use_dense_checkpoint = False
+        use_cross_encoder = False
+    elif ablation_mode == "D":
+        logger.info(">>> Modalità Ablation D: Dense Fine-Tuned Alone <<<")
+        use_cross_encoder = False
+    elif ablation_mode == "E":
+        logger.info(">>> Modalità Ablation E: BM25 + Dense RRF (No Reranker) <<<")
+        use_cross_encoder = False
+    elif ablation_mode == "F":
+        logger.info(">>> Modalità Ablation F: BM25 + Dense RRF + Pretrained Reranker <<<")
+        use_cross_encoder = True
+        use_cross_finetuned = False
+    elif ablation_mode == "G":
+        logger.info(">>> Modalità Ablation G: BM25 + Dense RRF + Fine-Tuned Reranker <<<")
+        use_cross_encoder = True
+        use_cross_finetuned = True
+
+    # Rilevamento Hardware coerente (CUDA per Cloud/T4, MPS per Mac, CPU come fallback)
+    target_dev = gen_cfg.get("device", "auto").lower()
+    if target_dev == "cpu":
+        device = torch.device("cpu")
+    elif target_dev == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif target_dev == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
-        device = torch.device(device_pref)
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
 
-    use_amp = bool(gen_cfg.get("mixed_precision", False) and device.type == "cuda")
-    logger.info(f"Avvio valutazione offline su device: {device} | Split target: '{split.upper()}'")
+    use_amp = bool(gen_cfg.get("mixed_precision", True) and device.type == "cuda")
+    logger.info(f"Avvio Valutazione [Split: {split.upper()}] su Device: {device} | AMP FP16: {use_amp}")
 
-    # Percorso dati
-    data_mode = paths_cfg.get("data_mode", "full")
-    base_data_dir = Path(paths_cfg.get("sample_data_dir" if data_mode == "sample" else "full_data_dir"))
+    base_data_dir = Path(paths_cfg.get("full_data_dir" if paths_cfg.get("data_mode") == "full" else "sample_data_dir"))
+    domains = TRACK2_DOMAINS if dom_cfg.get("active_domains") == "all" else dom_cfg.get("active_domains")
 
-    # Selezione domini
-    active_domains_cfg = dom_cfg.get("active_domains", "all")
-    domains = TRACK2_DOMAINS if active_domains_cfg == "all" else active_domains_cfg
-    logger.info(f"Domini in valutazione ({len(domains)}): {domains}")
+    # Inizializzazione Tokenizer
+    model_name = bi_cfg.get("model_name_or_path", "BAAI/bge-base-en-v1.5")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    bi_encoder, tokenizer, cross_encoder = load_models(config, device)
+    # Query Formatter deterministico
+    q_inst = bi_cfg.get("query_instruction", {}).get("text", "") if bi_cfg.get("query_instruction", {}).get("enabled", False) else ""
+    formatter = ContextAwareQueryFormatter(
+        tokenizer=tokenizer,
+        max_query_length=data_cfg.get("max_query_length", 256),
+        query_instruction=q_inst,
+        strategy=query_strategy,
+    )
 
-    batch_size = eval_cfg.get("eval_batch_size", 32)
-    max_doc_len = data_cfg.get("max_doc_length", 128)
-    max_q_len = data_cfg.get("max_query_length", 128)
+    # Inizializzazione Bi-Encoder
+    bi_encoder = ConversationalBiEncoder(
+        model_name_or_path=model_name,
+        temperature=bi_cfg.get("temperature", 0.05),
+        normalize_embeddings=bi_cfg.get("normalize_embeddings", True),
+        pooling_strategy=bi_cfg.get("pooling_strategy", "mean"),
+        lora_cfg=lora_cfg if use_dense_checkpoint else None,
+    ).to(device)
+
+    checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a/bi_encoder"))
+    best_pt = checkpoint_dir / "best_model.pt"
+    best_hf = checkpoint_dir / "best_hf_model"
+
+    if use_dense_checkpoint:
+        if best_pt.exists():
+            logger.info(f"Caricamento checkpoint Bi-Encoder da: {best_pt}")
+            ckpt = torch.load(best_pt, map_location=device)
+            bi_encoder.load_state_dict(ckpt["model_state_dict"], strict=False)
+        elif (best_hf / "adapter_config.json").exists():
+            logger.info(f"Caricamento adapter LoRA da: {best_hf}")
+            from peft import PeftModel
+            bi_encoder.encoder = PeftModel.from_pretrained(bi_encoder.encoder, str(best_hf))
+        else:
+            logger.info(f"Nessun checkpoint trovato in {checkpoint_dir}. Valutazione Bi-Encoder Pretrained.")
+    else:
+        logger.info("Valutazione Bi-Encoder Pretrained (Ablation).")
+
+    bi_encoder.eval()
+
+    # Inizializzazione Cross-Encoder (se richiesto)
+    cross_encoder = None
+    cross_tok = None
+    if use_cross_encoder and not (ablation_mode in ["A", "B", "C", "D", "E"]):
+        reranker_name = cross_cfg.get("model_name_or_path", "BAAI/bge-reranker-base")
+        logger.info(f"Inizializzazione Cross-Encoder: {reranker_name}")
+        cross_tok = AutoTokenizer.from_pretrained(reranker_name)
+        cross_encoder = ConversationalCrossEncoder(
+            model_name_or_path=reranker_name,
+            num_labels=1,
+            use_lora=cross_cfg.get("use_lora", False),
+        ).to(device)
+
+        cross_ckpt_dir = Path(cross_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a/cross_encoder"))
+        fine_tuned_pt = cross_ckpt_dir / "best_reranker.pt"
+
+        if use_cross_finetuned and fine_tuned_pt.exists():
+            logger.info(f"Caricamento pesi Cross-Encoder FINE-TUNED da: {fine_tuned_pt}")
+            c_ckpt = torch.load(fine_tuned_pt, map_location=device)
+            cross_encoder.load_state_dict(c_ckpt["model_state_dict"], strict=False)
+        else:
+            logger.info("Utilizzo Cross-Encoder PRETRAINED.")
+        cross_encoder.eval()
+
+    # Inizializzazione Cache Embeddings
+    emb_cache = DocumentEmbeddingCache(
+        cache_dir=Path(paths_cfg.get("embedding_cache_dir", "data/cache/document_embeddings")),
+        model_tag=model_name.replace("/", "_") + ("_tuned" if use_dense_checkpoint and best_pt.exists() else "_pre"),
+        pooling=bi_cfg.get("pooling_strategy", "mean"),
+        max_len=data_cfg.get("max_doc_length", 256),
+    )
+
     cutoff_k = eval_cfg.get("cutoff_k", 10)
-    top_candidates = hybrid_cfg.get("top_candidates_to_rerank", 50)
+    top_candidates = hybrid_cfg.get("top_candidates_to_rerank", 100)
+    rrf_k = hybrid_cfg.get("rrf_k", 60)
 
-    domain_ndcg_scores: Dict[str, float] = {}
-    start_total_time = time.time()
+    all_reports: Dict[str, Dict[str, Dict[str, float]]] = {
+        "Dense": {},
+        "BM25": {},
+        "RRF": {},
+        "CrossEncoder": {},
+    }
+    final_trec_run: Dict[str, List[Tuple[str, float]]] = {}
 
     for domain in domains:
-        logger.info(f"\n--- Valutazione Dominio: {domain.upper()} ---")
+        logger.info(f"\n{'='*25} DOMINIO: {domain.upper()} {'='*25}")
         try:
-            corpus, samples, qrels = load_track2_domain_data(
-                data_dir=base_data_dir,
-                domain=domain,
-                split=split,
-                query_strategy=data_cfg.get("query_strategy", "concat"),
-            )
+            corpus, samples, qrels = load_track2_domain_data(base_data_dir, domain, split=split, formatter=formatter)
         except Exception as e:
             logger.warning(f"Salto dominio {domain}: {e}")
             continue
 
-        if not qrels:
-            logger.warning(f"File qrels mancante per {domain} nello split '{split}'. Impossibile calcolare nDCG.")
+        if not samples or not qrels:
+            logger.warning(f"Nessun dato o qrels trovato per {domain} nello split {split}.")
             continue
 
         doc_ids = list(corpus.keys())
         doc_texts = [corpus[did] for did in doc_ids]
 
-        # 1. Retrieval Denso
-        corpus_embs = encode_texts(doc_texts, tokenizer, bi_encoder, device, batch_size, max_doc_len, use_amp)
-        queries = [s.contextual_query for s in samples]
-        query_embs = encode_texts(queries, tokenizer, bi_encoder, device, batch_size, max_q_len, use_amp)
+        # 1. Retrieval Denso (con Cache su disco)
+        cached_data = emb_cache.load(domain, len(doc_ids))
+        if cached_data is not None:
+            corpus_embs, cached_doc_ids = cached_data
+            doc_ids = cached_doc_ids
+        else:
+            logger.info(f"Codifica densa corpus [{domain}] ({len(doc_texts)} passaggi)...")
+            all_embs = []
+            eval_bs = int(eval_cfg.get("eval_batch_size", 64))
+            with torch.no_grad():
+                for i in range(0, len(doc_texts), eval_bs):
+                    batch = doc_texts[i : i + eval_bs]
+                    tok = tokenizer(batch, padding=True, truncation=True, max_length=data_cfg.get("max_doc_length", 256), return_tensors="pt").to(device)
+                    with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                        embs = bi_encoder.encode(tok["input_ids"], tok["attention_mask"])
+                    all_embs.append(embs.cpu())
+            corpus_embs = torch.cat(all_embs, dim=0)
+            emb_cache.save(domain, corpus_embs, doc_ids)
 
-        scores_matrix = torch.matmul(query_embs, corpus_embs.transpose(0, 1)).numpy()
+        queries = [s.contextual_query for s in samples]
+        all_q_embs = []
+        eval_bs = int(eval_cfg.get("eval_batch_size", 64))
+        with torch.no_grad():
+            for i in range(0, len(queries), eval_bs):
+                batch = queries[i : i + eval_bs]
+                tok = tokenizer(batch, padding=True, truncation=True, max_length=data_cfg.get("max_query_length", 256), return_tensors="pt").to(device)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    embs = bi_encoder.encode(tok["input_ids"], tok["attention_mask"])
+                all_q_embs.append(embs.cpu())
+        query_embs = torch.cat(all_q_embs, dim=0)
+
+        scores_mat = torch.matmul(query_embs, corpus_embs.T).numpy()
         dense_run: Dict[str, List[Tuple[str, float]]] = {}
         for q_idx, sample in enumerate(samples):
-            q_sc = scores_matrix[q_idx]
-            top_idx = np.argsort(-q_sc)[:top_candidates]
-            dense_run[sample.topic_id] = [(doc_ids[idx], float(q_sc[idx])) for idx in top_idx]
+            top_idx = np.argsort(-scores_mat[q_idx])[:top_candidates]
+            dense_run[sample.topic_id] = [(doc_ids[idx], float(scores_mat[q_idx][idx])) for idx in top_idx]
 
-        # 2. Retrieval Lessicale BM25
+        bm25 = OfficialCompatibleBM25(corpus, k1=sparse_cfg.get("k1", 0.9), b=sparse_cfg.get("b", 0.4))
         bm25_run: Dict[str, List[Tuple[str, float]]] = {}
-        if sparse_cfg.get("enabled", True):
-            bm25 = SimpleBM25(corpus, k1=float(sparse_cfg.get("k1", 0.9)), b=float(sparse_cfg.get("b", 0.4)))
-            for sample in samples:
-                bm25_run[sample.topic_id] = bm25.get_top_k(sample.contextual_query, top_k=top_candidates)
+        for sample in samples:
+            raw_bm25_query = f"{sample.history} {sample.query}".strip()
+            bm25_run[sample.topic_id] = bm25.get_top_k(raw_bm25_query, top_k=top_candidates)
 
-        # 3. Fusione RRF
-        if hybrid_cfg.get("enabled", True) and bm25_run:
-            candidate_run = reciprocal_rank_fusion([dense_run, bm25_run], k=int(hybrid_cfg.get("rrf_k", 60)), top_n=top_candidates)
+        # 3. Fusione Reciprocal Rank Fusion (RRF)
+        rrf_run = reciprocal_rank_fusion([dense_run, bm25_run], k=rrf_k, top_n=top_candidates)
+
+        # 4. Selezione Candidati e Re-ranking Neurale
+        if ablation_mode in ["A", "B"]:
+            candidate_pool = bm25_run
+        elif ablation_mode in ["C", "D"]:
+            candidate_pool = dense_run
         else:
-            candidate_run = dense_run
+            candidate_pool = rrf_run
 
-        # 4. Re-ranking Neurale (Opzionale)
-        final_run: Dict[str, List[Tuple[str, float]]] = {}
-        if cross_cfg.get("enabled", False) and cross_encoder is not None:
-            cross_tok = AutoTokenizer.from_pretrained(cross_cfg.get("model_name_or_path", "BAAI/bge-reranker-base"))
-            for sample in samples:
-                cands = candidate_run.get(sample.topic_id, [])
+        final_domain_run: Dict[str, List[Tuple[str, float]]] = {}
+        if cross_encoder is not None and cross_tok is not None and not (ablation_mode in ["A", "B", "C", "D", "E"]):
+            ce_batch_size = int(cross_cfg.get("batch_size", 16))
+            ce_max_len = int(cross_cfg.get("max_seq_length", 384))
+
+            for sample in tqdm(samples, desc=f"Cross-Encoder [{domain}]", leave=False):
+                cands = candidate_pool.get(sample.topic_id, [])
                 if not cands:
                     continue
-                q_p = [sample.contextual_query] * len(cands)
-                d_p = [corpus[doc_id] for doc_id, _ in cands]
-                all_probs = []
+                q_list = [sample.contextual_query] * len(cands)
+                d_list = [corpus.get(d_id, "") for d_id, _ in cands]
+
+                all_scores = []
                 with torch.no_grad():
-                    for p_i in range(0, len(q_p), 32):
-                        enc = cross_tok(q_p[p_i:p_i+32], d_p[p_i:p_i+32], padding=True, truncation=True, max_length=128, return_tensors="pt").to(device)
-                        out = cross_encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
-                        probs = torch.sigmoid(out["logits"]).cpu().tolist()
-                        all_probs.extend(probs if isinstance(probs, list) else [probs])
-                reranked = sorted([(cands[idx][0], float(all_probs[idx])) for idx in range(len(cands))], key=lambda x: x[1], reverse=True)
-                final_run[sample.topic_id] = reranked[:cutoff_k]
+                    for p_i in range(0, len(q_list), ce_batch_size):
+                        enc = cross_tok(
+                            q_list[p_i : p_i + ce_batch_size],
+                            d_list[p_i : p_i + ce_batch_size],
+                            padding=True,
+                            truncation=True,
+                            max_length=ce_max_len,
+                            return_tensors="pt",
+                        ).to(device)
+                        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                            out = cross_encoder(enc["input_ids"], enc["attention_mask"])
+                            scores = out["logits"].squeeze(-1).cpu().tolist()
+                        all_scores.extend(scores if isinstance(scores, list) else [scores])
+
+                reranked = sorted([(cands[idx][0], float(all_scores[idx])) for idx in range(len(cands))], key=lambda x: x[1], reverse=True)
+                final_domain_run[sample.topic_id] = reranked[:cutoff_k]
         else:
-            for t_id, docs in candidate_run.items():
-                final_run[t_id] = docs[:cutoff_k]
+            for t_id, cands in candidate_pool.items():
+                final_domain_run[t_id] = cands[:cutoff_k]
 
-        # 5. Calcolo Metrica Ufficiale nDCG@10 tramite pytrec_eval
-        trec_format = {t_id: {d_id: sc for d_id, sc in d_list} for t_id, d_list in final_run.items()}
-        metrics = compute_official_ndcg(qrels, trec_format, cutoff=cutoff_k)
-        score = metrics.get(f"ndcg_cut_{cutoff_k}", 0.0)
-        domain_ndcg_scores[domain] = score
-        logger.info(f"Risultato {domain}: nDCG@{cutoff_k} = {score:.4f}")
+        final_trec_run.update(final_domain_run)
+
+        # Calcolo Diagnostico per tutti i 4 stadi
+        all_reports["Dense"][domain] = compute_detailed_metrics(qrels, dense_run, cutoff_k)
+        all_reports["BM25"][domain] = compute_detailed_metrics(qrels, bm25_run, cutoff_k)
+        all_reports["RRF"][domain] = compute_detailed_metrics(qrels, rrf_run, cutoff_k)
+        all_reports["CrossEncoder"][domain] = compute_detailed_metrics(qrels, final_domain_run, cutoff_k)
+
+        logger.info(
+            f"[{domain:<18}] | "
+            f"Dense nDCG@10: {all_reports['Dense'][domain]['nDCG@10']:.4f} | "
+            f"BM25: {all_reports['BM25'][domain]['nDCG@10']:.4f} | "
+            f"RRF: {all_reports['RRF'][domain]['nDCG@10']:.4f} | "
+            f"Finale: {all_reports['CrossEncoder'][domain]['nDCG@10']:.4f}"
+        )
 
     # ---------------------------------------------------------
-    # Stampa a video Report dei Risultati
+    # Report Tabellare e Macro-Average
     # ---------------------------------------------------------
-    logger.info("\n" + "=" * 55)
-    logger.info(f"TABELLA RISULTATI OFFLINE (SPLIT: {split.upper()})")
-    logger.info("=" * 55)
-    logger.info(f"{'Dominio':<25} | {'nDCG@10':<10}")
-    logger.info("-" * 40)
-    for dom, sc in sorted(domain_ndcg_scores.items()):
-        logger.info(f"{dom:<25} | {sc:.4f}")
+    logger.info("\n" + "=" * 80)
+    logger.info(f"{'STADIO RETRIEVAL':<16} | {'nDCG@10':<10} | {'Recall@10':<10} | {'Recall@50':<10} | {'Recall@100':<10} | {'MRR':<10}")
+    logger.info("-" * 80)
 
-    if domain_ndcg_scores:
-        macro_avg = sum(domain_ndcg_scores.values()) / len(domain_ndcg_scores)
-        logger.info("-" * 40)
-        logger.info(f"{'MACRO-AVERAGE':<25} | {macro_avg:.4f}")
-        logger.info("=" * 55)
+    summary_json: Dict[str, Any] = {"per_domain": all_reports, "macro_average": {}}
+    for stage in ["BM25", "Dense", "RRF", "CrossEncoder"]:
+        scores = all_reports[stage]
+        if not scores:
+            continue
+        macro_ndcg = float(np.mean([m[f"nDCG@{cutoff_k}"] for m in scores.values()]))
+        macro_r10 = float(np.mean([m["Recall@10"] for m in scores.values()]))
+        macro_r50 = float(np.mean([m["Recall@50"] for m in scores.values()]))
+        macro_r100 = float(np.mean([m["Recall@100"] for m in scores.values()]))
+        macro_mrr = float(np.mean([m["MRR"] for m in scores.values()]))
 
-        # Salvataggio bozza risultati
-        out_dir = Path(paths_cfg.get("output_dir", "outputs/subtrack_2a"))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        results_file = out_dir / f"evaluation_results_{split}.json"
-        save_json({"macro_average_ndcg10": macro_avg, "per_domain": domain_ndcg_scores}, results_file)
-        logger.info(f"Riepilogo salvato in: {results_file}")
+        summary_json["macro_average"][stage] = {
+            f"nDCG@{cutoff_k}": macro_ndcg,
+            "Recall@10": macro_r10,
+            "Recall@50": macro_r50,
+            "Recall@100": macro_r100,
+            "MRR": macro_mrr,
+        }
+        logger.info(f"{stage:<16} | {macro_ndcg:<10.4f} | {macro_r10:<10.4f} | {macro_r50:<10.4f} | {macro_r100:<10.4f} | {macro_mrr:<10.4f}")
 
-    logger.info(f"Tempo totale di valutazione: {time.time() - start_total_time:.1f}s\n")
+    logger.info("=" * 80)
 
+    # Salvataggio Output Run TREC e JSON
+    out_dir = Path(paths_cfg.get("output_dir", "outputs/subtrack_2a"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_{ablation_mode}" if ablation_mode else ""
+    save_json(summary_json, out_dir / f"evaluation_report_{split}{suffix}.json")
+
+    trec_file = Path(paths_cfg.get("dev_run_file", out_dir / f"dev_run{suffix}.trec"))
+    write_trec_run(final_trec_run, trec_file, run_tag=gen_cfg.get("run_tag", "reteco_2a"), max_k=cutoff_k)
+    is_valid, errs = validate_trec_file(trec_file, max_rank=cutoff_k)
+    if is_valid:
+        logger.info(f"✓ File TREC validato e salvato in: {trec_file}")
+    else:
+        logger.error(f"Errori nel file TREC: {errs[:3]}")
+
+
+# ==============================================================================
+# 4. Entrypoint CLI
+# ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Valutazione diagnostica offline Sub-track 2a")
-    parser.add_argument("--config", type=str, default="config/config.yaml", help="Percorso al file config.yaml")
-    parser.add_argument("--split", type=str, default="dev", choices=["dev", "train"], help="Split da valutare (default: dev)")
+    parser = argparse.ArgumentParser(description="Inference e Valutazione SemEval Sub-track 2a")
+    parser.add_argument("--config", type=str, default="config/config.yaml")
+    parser.add_argument("--split", type=str, default="dev", choices=["dev", "train"])
+    parser.add_argument("--ablation", type=str, default=None, choices=["A", "B", "C", "D", "E", "F", "G"],
+                        help="A=BM25-curr, B=BM25-hist, C=Dense-pre, D=Dense-tuned, E=RRF, F=RRF+pre-rerank, G=RRF+tuned-rerank")
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
     if not cfg_path.exists():
-        alt_path = Path("config") / Path(args.config).name
-        cfg_path = alt_path if alt_path.exists() else Path("config/config.yaml")
-
+        cfg_path = Path("config") / Path(args.config).name
     config = load_config(cfg_path)
-    evaluate_offline(config, split=args.split)
+
+    # Inizializzazione handler su file con timestamp dopo aver letto il config
+    paths_cfg = config.get("paths", {})
+    gen_cfg = config.get("general", {})
+    log_dir = Path(paths_cfg.get("log_dir", "outputs/subtrack_2a/logs"))
+    run_tag = gen_cfg.get("run_tag", "eval")
+    log_level = gen_cfg.get("logging_level", "INFO")
+
+    global logger
+    try:
+        logger = setup_logger(log_dir=log_dir, run_tag=f"eval_{run_tag}", log_level=log_level)
+    except Exception:
+        pass
+
+    run_evaluation(config, split=args.split, ablation_mode=args.ablation)
 
 
 if __name__ == "__main__":

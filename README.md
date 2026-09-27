@@ -234,14 +234,7 @@ python download_data.py --task 2a
 ### Step 3: Addestramento del Bi-Encoder
 
 ```bash
-cd subtrack_2a
-
-# Smoke test su Mac Air (MPS, 1 epoca, sequenze corte)
-python train.py --config config/test_config.yaml
-
-# Addestramento completo su Lightning AI Studio (GPU T4, FP16 nativo, 5 epoche)
-python train.py --config config/config.yaml
-
+python subtrack_2a/train.py --config subtrack_2a/config/config.yaml
 ```
 
 ### Step 4: Valutazione Offline delle Prestazioni (Diagnostica Interna)
@@ -249,7 +242,7 @@ python train.py --config config/config.yaml
 Misura l'efficacia del modello calcolando l'**$nDCG@10$ ufficiale** sui giudizi di rilevanza noti di `dev`:
 
 ```bash
-python inference.py --config config/test_config.yaml --split dev
+python subtrack_2a/inference.py --config subtrack_2a/config/config.yaml --split dev
 
 ```
 
@@ -259,7 +252,7 @@ Genera il file `.trec` a 6 colonne pronto per il caricamento su CodaLab/CodaBenc
 
 ```bash
 # Genera il file di sottomissione
-python generate_submission.py --config config/test_config.yaml --split dev --tag IL_TUO_TEAM_RUN1
+python subtrack_2a/generate_submission.py --config subtrack_2a/config/config.yaml --split dev --tag IL_TUO_TEAM_RUN1
 
 # Verifica di conformità ufficiale con il format checker degli organizzatori
 python ../starter_kit/format_checker.py outputs/subtrack_2a/submission_2a.trec
