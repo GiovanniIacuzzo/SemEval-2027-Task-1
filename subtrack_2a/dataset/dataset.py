@@ -62,10 +62,9 @@ class ConversationalTurnSample:
 # ==============================================================================
 class ContextAwareQueryFormatter:
     """
-    Costruisce la query conversazionale gestendo il budget dei token.
-    Priorità:
-      1. Domanda Corrente (Current Question): Preservata integralmente.
-      2. Cronologia Recente (Conversation History): Assegnata nel budget residuo dal lato più recente.
+    Costruzione deterministica del contesto a budget.
+    La domanda corrente ha priorità assoluta di allocazione token.
+    La cronologia viene aggiunta a ritroso per turni interi dal più recente al più vecchio.
     """
 
     def __init__(
@@ -82,10 +81,13 @@ class ContextAwareQueryFormatter:
 
         self.stats = {
             "total_queries": 0,
-            "truncated_queries": 0,
-            "current_question_exceeded_budget": 0,
-            "total_query_tokens": 0,
-            "total_history_tokens_kept": 0,
+            "question_truncated": 0,
+            "history_fully_retained": 0,
+            "history_partially_retained": 0,
+            "raw_q_tokens": 0,
+            "raw_hist_tokens": 0,
+            "retained_hist_tokens": 0,
+            "final_tokens": 0,
         }
 
     def format(self, query: str, history: str) -> str:
@@ -95,61 +97,77 @@ class ContextAwareQueryFormatter:
         if history_clean.lower() == "no previous conversation.":
             history_clean = ""
 
+        prefix = f"{self.query_instruction} " if self.query_instruction else ""
+
+        # Diagnostica token grezzi
+        q_raw_toks = self.tokenizer.tokenize(query_clean)
+        self.stats["raw_q_tokens"] += len(q_raw_toks)
+
         if self.strategy == "query_only" or not history_clean:
-            formatted = f"Current Question: {query_clean}"
-            toks = self.tokenizer.tokenize(formatted)
-            self.stats["total_query_tokens"] += len(toks)
+            formatted = f"{prefix}Current Question: {query_clean}"
+            final_toks = self.tokenizer.tokenize(formatted)
+            self.stats["final_tokens"] += min(len(final_toks), self.max_query_length)
             return formatted
 
-        # Intestazione domanda corrente
-        prefix = f"{self.query_instruction} " if self.query_instruction else ""
-        header_q = f"{prefix}Current Question: {query_clean}\n\nConversation History:\n"
-        
-        q_tokens = self.tokenizer.tokenize(header_q)
-        q_len = len(q_tokens)
-        self.stats["total_query_tokens"] += q_len
+        hist_raw_toks = self.tokenizer.tokenize(history_clean)
+        self.stats["raw_hist_tokens"] += len(hist_raw_toks)
 
-        # Se la domanda supera o satura il budget, esclude la storia
-        if q_len >= self.max_query_length:
-            self.stats["truncated_queries"] += 1
-            self.stats["current_question_exceeded_budget"] += 1
+        header_q = f"{prefix}Current Question: {query_clean}\n\nConversation History:\n"
+        header_toks = self.tokenizer.tokenize(header_q)
+        header_len = len(header_toks)
+
+        # Se la sola domanda satura o eccede il budget massimo
+        if header_len >= self.max_query_length:
+            self.stats["question_truncated"] += 1
+            self.stats["final_tokens"] += self.max_query_length
+            # Troncatura protetta della sola domanda
             return f"{prefix}Current Question: {query_clean}"
 
-        residual_budget = self.max_query_length - q_len
+        residual_budget = self.max_query_length - header_len
 
-        # Ottimizzazione: pre-ritaglio stringa per evitare tokenizzazioni > 512 token
-        # ~4 caratteri per token: teniamo al massimo il quadruplo dei caratteri necessari dal lato recente
-        char_window = residual_budget * 8
-        if len(history_clean) > char_window:
-            history_clean = history_clean[-char_window:]
+        # Suddivisione della cronologia in turni/blocchi logici
+        # Identifica pattern 'User:', 'Assistant:', 'Q:', 'A:' o linee multiple
+        turn_delimiters = re.split(r"(?=(?:User:|Assistant:|Q:|A:|\n\n))", history_clean)
+        turns = [t.strip() for t in turn_delimiters if t.strip()]
 
-        # Tokenizzazione sicura disattivando temporaneamente il warning di lunghezza del tokenizer
-        orig_max_len = getattr(self.tokenizer, "model_max_length", 512)
-        try:
-            self.tokenizer.model_max_length = 100000  # Evita il warning (531 > 512)
-            hist_tokens = self.tokenizer.tokenize(history_clean)
-        finally:
-            self.tokenizer.model_max_length = orig_max_len
+        if not turns:
+            turns = [history_clean]
 
-        if len(hist_tokens) <= residual_budget:
-            history_kept = history_clean
-            self.stats["total_history_tokens_kept"] += len(hist_tokens)
-        else:
-            self.stats["truncated_queries"] += 1
-            kept_tokens = hist_tokens[-residual_budget:]
-            history_kept = self.tokenizer.convert_tokens_to_string(kept_tokens).strip()
-            self.stats["total_history_tokens_kept"] += len(kept_tokens)
+        retained_turns = []
+        accumulated_tokens = 0
 
-        return f"{header_q}{history_kept}"
+        # Inclusione a ritroso dal turno più recente verso il più vecchio
+        for turn in reversed(turns):
+            turn_toks = self.tokenizer.tokenize(turn)
+            if accumulated_tokens + len(turn_toks) <= residual_budget:
+                retained_turns.append(turn)
+                accumulated_tokens += len(turn_toks)
+            else:
+                break
+
+        if len(retained_turns) == len(turns):
+            self.stats["history_fully_retained"] += 1
+        elif len(retained_turns) > 0:
+            self.stats["history_partially_retained"] += 1
+
+        self.stats["retained_hist_tokens"] += accumulated_tokens
+        self.stats["final_tokens"] += header_len + accumulated_tokens
+
+        # Ricomponi la cronologia nell'ordine temporale naturale
+        reconstructed_history = "\n".join(reversed(retained_turns))
+        return f"{header_q}{reconstructed_history}".strip()
 
     def get_diagnostics(self) -> Dict[str, float]:
         n = max(1, self.stats["total_queries"])
         return {
             "total_queries": self.stats["total_queries"],
-            "pct_truncated": (self.stats["truncated_queries"] / n) * 100.0,
-            "pct_question_exceeded": (self.stats["current_question_exceeded_budget"] / n) * 100.0,
-            "avg_query_tokens": self.stats["total_query_tokens"] / n,
-            "avg_history_tokens_kept": self.stats["total_history_tokens_kept"] / n,
+            "pct_question_truncated": (self.stats["question_truncated"] / n) * 100.0,
+            "pct_hist_full": (self.stats["history_fully_retained"] / n) * 100.0,
+            "pct_hist_partial": (self.stats["history_partially_retained"] / n) * 100.0,
+            "avg_raw_q_tokens": self.stats["raw_q_tokens"] / n,
+            "avg_raw_hist_tokens": self.stats["raw_hist_tokens"] / n,
+            "avg_retained_hist_tokens": self.stats["retained_hist_tokens"] / n,
+            "avg_final_tokens": self.stats["final_tokens"] / n,
         }
 
 

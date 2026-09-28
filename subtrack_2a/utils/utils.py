@@ -2,123 +2,33 @@
 """
 subtrack_2a/utils/utils.py
 
-Modulo di utilità per SemEval-2027 RETECO Sub-track 2a (Conversational Retrieval).
-Fornisce:
-  - Caricamento e salvataggio configurazioni (YAML / JSON).
-  - Calcolo ufficiale della metrica nDCG@10 tramite pytrec_eval (con fallback in puro Python per Mac Air).
-  - Scrittura ed esportazione dei run file a 6 colonne nel formato standard TREC.
-  - Validazione formale del run file (controllo duplicati, ordinamento score, coerenza rank).
-  - Fusione di graduatorie tramite Reciprocal Rank Fusion (RRF) per pipeline ibride (BM25 + Dense).
-  - Tracciamento grafico delle curve di addestramento (Loss, nDCG@10).
+Funzioni di utilità per SemEval-2027 Sub-track 2a:
+  - Valutazione nDCG ufficiale conforme con penalizzazione topic mancanti (score 0.0).
+  - Reciprocal Rank Fusion ponderata.
+  - Scrittura e validazione formale TREC a 6 colonne.
 """
 
 import os
-import torch
-from datetime import datetime
-import random
-import numpy as np
 import sys
+import yaml
 import json
-import math
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Any, Optional, Union
 
-try:
-    import yaml
-except ImportError:
-    yaml = None
-
-try:
-    import pytrec_eval
-except ImportError:
-    pytrec_eval = None
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+import pytrec_eval
+import numpy as np
 
 
-# =========================================================================
-# 1. Configurazione e I/O Files
-# =========================================================================
-
-def load_config(config_path: Union[str, Path]) -> Dict[str, Any]:
-    """Carica un file di configurazione YAML."""
-    config_path = Path(config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"File di configurazione non trovato: {config_path}")
-
-    if yaml is None:
-        raise ImportError("PyYAML non è installato. Esegui: pip install pyyaml")
-
+def load_config(config_path: Path) -> Dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    return config
+        return yaml.safe_load(f)
 
 
-def save_json(data: Any, output_path: Union[str, Path], indent: int = 2) -> None:
-    """Salva una struttura dati in formato JSON serializzato."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent, ensure_ascii=False)
-
-
-def load_json(file_path: Union[str, Path]) -> Any:
-    """Carica in modo sicuro un file JSON."""
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File non trovato: {file_path}")
-    with open(file_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-# =========================================================================
-# 2. Metriche Ufficiali di Retrieval (nDCG@10)
-# =========================================================================
-
-def _compute_ndcg_fallback(
-    qrels: Dict[str, Dict[str, int]],
-    run: Dict[str, Dict[str, float]],
-    cutoff: int = 10,
-) -> float:
-    """
-    Calcolo deterministico di nDCG@k in puro Python (equivalente a pytrec_eval ndcg_cut_k).
-    Utile per test rapidi sul Mac Air se pytrec_eval o compilatori C non sono disponibili.
-    """
-    all_ndcg = []
-
-    for topic_id, doc_scores in run.items():
-        if topic_id not in qrels:
-            continue
-
-        topic_qrels = qrels[topic_id]
-        
-        # Ordina i documenti estratti per punteggio decrescente
-        ranked_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)[:cutoff]
-
-        # Calcolo DCG@k
-        dcg = 0.0
-        for rank_idx, (doc_id, _) in enumerate(ranked_docs, start=1):
-            rel = topic_qrels.get(doc_id, 0)
-            if rel > 0:
-                dcg += (math.pow(2, rel) - 1.0) / math.log2(rank_idx + 1.0)
-
-        # Calcolo IDCG@k (Ideal DCG)
-        ideal_rels = sorted(topic_qrels.values(), reverse=True)[:cutoff]
-        idcg = 0.0
-        for rank_idx, rel in enumerate(ideal_rels, start=1):
-            if rel > 0:
-                idcg += (math.pow(2, rel) - 1.0) / math.log2(rank_idx + 1.0)
-
-        ndcg = (dcg / idcg) if idcg > 0.0 else 0.0
-        all_ndcg.append(ndcg)
-
-    return sum(all_ndcg) / len(all_ndcg) if all_ndcg else 0.0
+def save_json(data: Any, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def compute_official_ndcg(
@@ -127,139 +37,100 @@ def compute_official_ndcg(
     cutoff: int = 10,
 ) -> Dict[str, float]:
     """
-    Calcola nDCG@k ufficiale[cite: 1, 2].
-    Se pytrec_eval è installato, utilizza l'implementazione C ufficiale del benchmark[cite: 1, 2].
-    In caso contrario, esegue il fallback in puro Python con avviso[cite: 1].
+    Calcola nDCG@K ufficiale tramite pytrec_eval.
+    CONFORMITÀ UFFICIALE: Qualsiasi topic presente nei qrels ma assente
+    nella run riceve rigorosamente score 0.0.
     """
-    if not qrels or not run:
+    if not qrels:
         return {f"ndcg_cut_{cutoff}": 0.0}
 
-    metric_name = f"ndcg_cut_{cutoff}"
+    evaluator = pytrec_eval.RelevanceEvaluator(qrels, {f"ndcg_cut_{cutoff}"})
+    # Valuta solo i topic presenti nella run
+    raw_scores = evaluator.evaluate(run)
 
-    if pytrec_eval is not None:
-        evaluator = pytrec_eval.RelevanceEvaluator(qrels, {f"ndcg_cut.{cutoff}"})
-        eval_scores = evaluator.evaluate(run)
-        
-        mean_ndcg = sum(
-            query_metrics.get(metric_name, 0.0) for query_metrics in eval_scores.values()
-        ) / max(len(eval_scores), 1)
+    # I topic mancanti nei qrels ricevono 0.0
+    all_ndcg = []
+    for topic_id in qrels.keys():
+        if topic_id in raw_scores:
+            all_ndcg.append(raw_scores[topic_id].get(f"ndcg_cut_{cutoff}", 0.0))
+        else:
+            all_ndcg.append(0.0)
 
-        return {metric_name: mean_ndcg}
-    else:
-        logger.warning("pytrec_eval non rilevato. Viene utilizzato il calcolo fallback in Python.")
-        score = _compute_ndcg_fallback(qrels, run, cutoff=cutoff)
-        return {metric_name: score}
+    mean_score = float(np.mean(all_ndcg)) if all_ndcg else 0.0
+    return {f"ndcg_cut_{cutoff}": mean_score}
 
 
-# =========================================================================
-# 3. Formato TREC a 6 Colonne e Validatore Formale
-# =========================================================================
+def reciprocal_rank_fusion(
+    runs: List[Dict[str, List[Tuple[str, float]]]],
+    k: int = 30,
+    weights: Optional[List[float]] = None,
+    top_n: int = 100,
+) -> Dict[str, List[Tuple[str, float]]]:
+    """Reciprocal Rank Fusion ponderata con k ottimizzato."""
+    if weights is None:
+        weights = [1.0] * len(runs)
+    elif len(weights) != len(runs):
+        raise ValueError("I pesi devono corrispondere al numero di liste run.")
+
+    all_topics = set()
+    for r in runs:
+        all_topics.update(r.keys())
+
+    fused_run: Dict[str, List[Tuple[str, float]]] = {}
+    for tid in all_topics:
+        scores = {}
+        for r_idx, r in enumerate(runs):
+            w = weights[r_idx]
+            q_list = r.get(tid, [])
+            for rank, (doc_id, _) in enumerate(q_list, 1):
+                scores[doc_id] = scores.get(doc_id, 0.0) + w * (1.0 / (k + rank))
+
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        fused_run[tid] = sorted_docs
+
+    return fused_run
+
 
 def write_trec_run(
     run_dict: Dict[str, List[Tuple[str, float]]],
-    output_path: Union[str, Path],
-    run_tag: str = "retrieval_2a",
+    output_path: Path,
+    run_tag: str = "reteco_run",
     max_k: int = 10,
-) -> None:
-    """
-    Esporta i risultati nel formato standard TREC a 6 colonne[cite: 2]:
-        <topic_id> Q0 <doc_id> <rank> <score> <tag>
-    
-    Args:
-        run_dict: Dizionario {topic_id: [(doc_id, score), ...]}
-        output_path: Percorso del file .trec da salvare
-        run_tag: Identificativo del sistema
-        max_k: Numero massimo di documenti per topic (standard RETECO: 10)[cite: 2, 8]
-    """
-    output_path = Path(output_path)
+):
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     with open(output_path, "w", encoding="utf-8") as f:
         for topic_id in sorted(run_dict.keys()):
-            # Ordina rigorosamente per punteggio decrescente
-            ranked_items = sorted(run_dict[topic_id], key=lambda x: x[1], reverse=True)[:max_k]
-            
-            seen_docs = set()
-            rank = 1
-            for doc_id, score in ranked_items:
-                if doc_id in seen_docs:
-                    continue  # Evita duplicati accidentali dello stesso documento[cite: 2]
-                seen_docs.add(doc_id)
-
+            doc_scores = run_dict[topic_id][:max_k]
+            for rank, (doc_id, score) in enumerate(doc_scores, 1):
                 f.write(f"{topic_id} Q0 {doc_id} {rank} {score:.6f} {run_tag}\n")
-                rank += 1
 
 
-def validate_trec_file(
-    trec_path: Union[str, Path],
-    max_rank: int = 10,
-) -> Tuple[bool, List[str]]:
-    """
-    Replica i controlli di integrità di format_checker.py dello starter kit ufficiale[cite: 1, 2]:
-      1. Esattamente 6 colonne per riga.
-      2. Seconda colonna sempre 'Q0'.
-      3. Rango strettamente sequenziale (1, 2, ..., k).
-      4. Punteggi non crescenti al crescere del rango.
-      5. Nessun documento duplicato per lo stesso topic.
-    """
-    trec_path = Path(trec_path)
-    if not trec_path.exists():
-        return False, [f"File {trec_path} non esistente."]
-
+def validate_trec_file(trec_path: Path, max_rank: int = 10) -> Tuple[bool, List[str]]:
     errors = []
-    lines_per_topic: Dict[str, List[Tuple[str, int, float]]] = {}
+    if not trec_path.exists():
+        return False, ["File TREC non esistente."]
+
+    seen_topics = set()
+    topic_ranks = {}
 
     with open(trec_path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
+        for idx, line in enumerate(f, 1):
             parts = line.strip().split()
-            if not parts:
-                continue
-
             if len(parts) != 6:
-                errors.append(f"Riga {line_num}: attese 6 colonne, trovate {len(parts)}.")
+                errors.append(f"Riga {idx}: Formato a 6 colonne violato ({len(parts)} colonne).")
                 continue
+            t_id, _, d_id, rank_str, _, _ = parts
+            rank = int(rank_str)
+            if rank > max_rank:
+                errors.append(f"Riga {idx}: Rango {rank} > max_rank {max_rank}.")
 
-            topic_id, q0, doc_id, rank_str, score_str, _ = parts
+            topic_ranks.setdefault(t_id, []).append(rank)
 
-            if q0 != "Q0":
-                errors.append(f"Riga {line_num}: colonna 2 deve essere 'Q0', trovato '{q0}'.")
+    for tid, ranks in topic_ranks.items():
+        if ranks != list(range(1, len(ranks) + 1)):
+            errors.append(f"Topic {tid}: Ranghi non ordinati sequenzialmente 1..{len(ranks)}.")
 
-            try:
-                rank = int(rank_str)
-                score = float(score_str)
-            except ValueError:
-                errors.append(f"Riga {line_num}: rank o score non numerici ({rank_str}, {score_str}).")
-                continue
-
-            if rank < 1 or rank > max_rank:
-                errors.append(f"Riga {line_num}: rank {rank} non compreso tra 1 e {max_rank}.")
-
-            lines_per_topic.setdefault(topic_id, []).append((doc_id, rank, score))
-
-    # Controllo coerenza di rango e monotonìa score
-    for topic_id, records in lines_per_topic.items():
-        seen_docs = set()
-        prev_rank = 0
-        prev_score = float("inf")
-
-        for doc_id, rank, score in records:
-            if doc_id in seen_docs:
-                errors.append(f"Topic '{topic_id}': documento duplicato '{doc_id}'.")
-            seen_docs.add(doc_id)
-
-            if rank != prev_rank + 1:
-                errors.append(f"Topic '{topic_id}': salto di rank tra {prev_rank} e {rank}.")
-            
-            if score > prev_score:
-                errors.append(
-                    f"Topic '{topic_id}': score non decrescente (rank {rank} ha {score} > {prev_score})."
-                )
-
-            prev_rank = rank
-            prev_score = score
-
-    is_valid = len(errors) == 0
-    return is_valid, errors
+    return len(errors) == 0, errors
 
 
 # =========================================================================

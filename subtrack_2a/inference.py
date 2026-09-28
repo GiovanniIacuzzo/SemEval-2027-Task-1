@@ -58,19 +58,25 @@ if not logger.handlers:
 # ==============================================================================
 # 1. Gestore della Cache degli Embedding Documentali
 # ==============================================================================
-
 class DocumentEmbeddingCache:
-    """Gestisce la memorizzazione su disco degli embedding del corpus con controllo di consistenza."""
+    """Cache degli embedding su disco con fingerprint del checkpoint per evitare collisioni."""
 
-    def __init__(self, cache_dir: Path, model_tag: str, pooling: str, max_len: int):
+    def __init__(self, cache_dir: Path, model_tag: str, pooling: str, max_len: int, ckpt_path: Optional[Path] = None):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.model_tag = model_tag
         self.pooling = pooling
         self.max_len = max_len
 
+        # Calcola la fingerprint dei pesi del checkpoint
+        self.ckpt_hash = "pretrained"
+        if ckpt_path is not None and ckpt_path.exists():
+            with open(ckpt_path, "rb") as f:
+                # Legge i primi 512KB per ottenere un hash veloce ma univoco dei pesi
+                self.ckpt_hash = hashlib.sha256(f.read(524288)).hexdigest()[:10]
+
     def _get_hash_key(self, domain: str, corpus_size: int) -> str:
-        key_str = f"{self.model_tag}_{self.pooling}_{self.max_len}_{domain}_{corpus_size}"
+        key_str = f"{self.model_tag}_{self.ckpt_hash}_{self.pooling}_{self.max_len}_{domain}_{corpus_size}"
         return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
 
     def load(self, domain: str, corpus_size: int) -> Optional[Tuple[torch.Tensor, List[str]]]:
@@ -82,19 +88,18 @@ class DocumentEmbeddingCache:
             try:
                 with open(meta_file, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                if meta.get("corpus_size") == corpus_size and meta.get("max_len") == self.max_len:
-                    logger.info(f"✓ Cache trovata per [{domain}] ({corpus_size} docs). Caricamento immediato...")
-                    data = torch.load(emb_file, map_location="cpu")
+                if meta.get("corpus_size") == corpus_size and meta.get("ckpt_hash") == self.ckpt_hash:
+                    logger.info(f"✓ Cache trovata per [{domain}] (Hash: {self.ckpt_hash}). Caricamento immediato...")
+                    data = torch.load(emb_file, map_location="cpu", weights_only=True)
                     return data["embeddings"], data["doc_ids"]
-            except Exception as e:
-                logger.warning(f"Errore lettura cache per {domain}: {e}. Ricalcolo...")
+            except Exception:
+                pass
         return None
 
     def save(self, domain: str, embeddings: torch.Tensor, doc_ids: List[str]):
         hash_key = self._get_hash_key(domain, len(doc_ids))
         emb_file = self.cache_dir / f"embs_{domain}_{hash_key}.pt"
         meta_file = self.cache_dir / f"meta_{domain}_{hash_key}.json"
-
         try:
             torch.save({"embeddings": embeddings.cpu(), "doc_ids": doc_ids}, emb_file)
             with open(meta_file, "w", encoding="utf-8") as f:
@@ -102,14 +107,12 @@ class DocumentEmbeddingCache:
                     "domain": domain,
                     "corpus_size": len(doc_ids),
                     "model_tag": self.model_tag,
+                    "ckpt_hash": self.ckpt_hash,
                     "pooling": self.pooling,
                     "max_len": self.max_len,
-                    "timestamp": time.time(),
                 }, f)
-            logger.info(f"✓ Embeddings per [{domain}] salvati in cache: {emb_file.name}")
         except Exception as e:
-            logger.warning(f"Salvataggio cache non riuscito: {e}")
-
+            logger.warning(f"Salvataggio cache fallito per {domain}: {e}")
 
 # ==============================================================================
 # 2. Calcolo Metriche Diagnostiche
@@ -363,11 +366,17 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
             top_idx = np.argsort(-scores_mat[q_idx])[:top_candidates]
             dense_run[sample.topic_id] = [(doc_ids[idx], float(scores_mat[q_idx][idx])) for idx in top_idx]
 
-        bm25 = OfficialCompatibleBM25(corpus, k1=sparse_cfg.get("k1", 0.9), b=sparse_cfg.get("b", 0.4))
-        bm25_run: Dict[str, List[Tuple[str, float]]] = {}
-        for sample in samples:
-            raw_bm25_query = f"{sample.history} {sample.query}".strip()
-            bm25_run[sample.topic_id] = bm25.get_top_k(raw_bm25_query, top_k=top_candidates)
+        bm25_run = {}
+        if sparse_cfg.get("enabled", True):
+            bm25 = OfficialCompatibleBM25(corpus, k1=sparse_cfg.get("k1", 0.9), b=sparse_cfg.get("b", 0.4))
+            for sample in samples:
+                if ablation_mode == "A":
+                    # Ablation A: Solo turno corrente
+                    raw_bm25_query = sample.query.strip()
+                else:
+                    # History completa pulita + Domanda
+                    raw_bm25_query = f"{sample.history} {sample.query}".strip()
+                bm25_run[sample.topic_id] = bm25.get_top_k(raw_bm25_query, top_k=top_candidates)
 
         # 3. Fusione Reciprocal Rank Fusion (RRF)
         rrf_run = reciprocal_rank_fusion([dense_run, bm25_run], k=rrf_k, top_n=top_candidates)
