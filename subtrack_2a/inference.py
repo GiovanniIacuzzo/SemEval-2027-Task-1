@@ -303,26 +303,77 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
     # Inizializzazione Cross-Encoder (se richiesto)
     cross_encoder = None
     cross_tok = None
-    if use_cross_encoder and not (ablation_mode in ["A", "B", "C", "D", "E"]):
-        reranker_name = cross_cfg.get("model_name_or_path", "BAAI/bge-reranker-base")
-        logger.info(f"Inizializzazione Cross-Encoder: {reranker_name}")
-        cross_tok = AutoTokenizer.from_pretrained(reranker_name)
-        cross_encoder = ConversationalCrossEncoder(
-            model_name_or_path=reranker_name,
-            num_labels=1,
-            use_lora=cross_cfg.get("use_lora", False),
-        ).to(device)
+    fine_tuned_pt = None
 
-        cross_ckpt_dir = Path(cross_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a/cross_encoder"))
+    if use_cross_encoder and not (ablation_mode in ["A", "B", "C", "D", "E"]):
+        reranker_name = cross_cfg.get(
+            "model_name_or_path",
+            "BAAI/bge-reranker-base"
+        )
+
+        cross_ckpt_dir = Path(
+            cross_cfg.get(
+                "checkpoint_dir",
+                "checkpoints/subtrack_2a/cross_encoder"
+            )
+        )
+
         fine_tuned_pt = cross_ckpt_dir / "best_reranker.pt"
 
+        # Il pretrained reranker viene usato solo nelle ablation esplicite F.
+        # Nel run principale, senza checkpoint fine-tuned, manteniamo RRF.
+        use_pretrained_reranker = ablation_mode == "F"
+
         if use_cross_finetuned and fine_tuned_pt.exists():
-            logger.info(f"Caricamento pesi Cross-Encoder FINE-TUNED da: {fine_tuned_pt}")
-            c_ckpt = torch.load(fine_tuned_pt, map_location=device)
-            cross_encoder.load_state_dict(c_ckpt["model_state_dict"], strict=False)
+            logger.info(
+                f"Inizializzazione Cross-Encoder FINE-TUNED: {reranker_name}"
+            )
+
+            cross_tok = AutoTokenizer.from_pretrained(reranker_name)
+
+            cross_encoder = ConversationalCrossEncoder(
+                model_name_or_path=reranker_name,
+                num_labels=1,
+                use_lora=cross_cfg.get("use_lora", False),
+            ).to(device)
+
+            c_ckpt = torch.load(
+                fine_tuned_pt,
+                map_location=device
+            )
+
+            cross_encoder.load_state_dict(
+                c_ckpt["model_state_dict"],
+                strict=False
+            )
+
+            cross_encoder.eval()
+
+            logger.info(
+                f"✓ Cross-Encoder fine-tuned caricato da: {fine_tuned_pt}"
+            )
+
+        elif use_pretrained_reranker:
+            logger.info(
+                f"Utilizzo Cross-Encoder PRETRAINED per Ablation F: "
+                f"{reranker_name}"
+            )
+
+            cross_tok = AutoTokenizer.from_pretrained(reranker_name)
+
+            cross_encoder = ConversationalCrossEncoder(
+                model_name_or_path=reranker_name,
+                num_labels=1,
+                use_lora=cross_cfg.get("use_lora", False),
+            ).to(device)
+
+            cross_encoder.eval()
+
         else:
-            logger.info("Utilizzo Cross-Encoder PRETRAINED.")
-        cross_encoder.eval()
+            logger.info(
+                "Nessun Cross-Encoder fine-tuned disponibile: "
+                "il risultato finale sarà RRF."
+            )
 
     # Inizializzazione Cache Embeddings
     emb_cache = DocumentEmbeddingCache(
@@ -339,15 +390,29 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
         ckpt_path=best_pt if use_dense_checkpoint and best_pt.exists() else None,
     )
 
-    cutoff_k = eval_cfg.get("cutoff_k", 10)
-    top_candidates = hybrid_cfg.get("top_candidates_to_rerank", 100)
-    rrf_k = hybrid_cfg.get("rrf_k", 60)
+    cutoff_k = int(eval_cfg.get("cutoff_k", 10))
+    top_candidates = int(
+        hybrid_cfg.get("top_candidates_to_rerank", 100)
+    )
 
-    all_reports: Dict[str, Dict[str, Dict[str, float]]] = {
+    rrf_k_config = int(hybrid_cfg.get("rrf_k", 60))
+
+    rrf_sweep_values = [10, 30, 60, 100]
+
+    if rrf_k_config not in rrf_sweep_values:
+        rrf_sweep_values.append(rrf_k_config)
+
+    logger.info(
+        f"RRF configurato: k={rrf_k_config} | "
+        f"Sweep: {sorted(rrf_sweep_values)}"
+    )
+
+    all_reports: Dict[str, Any] = {
         "Dense": {},
         "BM25": {},
         "RRF": {},
-        "CrossEncoder": {},
+        "Final": {},
+        "RRF_sweep": {},
     }
     final_trec_run: Dict[str, List[Tuple[str, float]]] = {}
 
@@ -418,8 +483,37 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
                     top_k=top_candidates
                 )
 
-        # 3. Fusione Reciprocal Rank Fusion (RRF)
-        rrf_run = reciprocal_rank_fusion([dense_run, bm25_run], k=rrf_k, top_n=top_candidates)
+        # 3. Reciprocal Rank Fusion sweep
+        #
+        # Dense e BM25 sono già stati calcolati.
+        # Qui cambiamo soltanto k, quindi il costo aggiuntivo è molto basso.
+
+        rrf_runs_by_k: Dict[int, Dict[str, List[Tuple[str, float]]]] = {}
+        rrf_metrics_by_k: Dict[int, Dict[str, float]] = {}
+
+        for current_k in sorted(rrf_sweep_values):
+            current_rrf_run = reciprocal_rank_fusion(
+                [dense_run, bm25_run],
+                k=current_k,
+                top_n=top_candidates,
+            )
+
+            rrf_runs_by_k[current_k] = current_rrf_run
+
+            rrf_metrics_by_k[current_k] = compute_detailed_metrics(
+                qrels,
+                current_rrf_run,
+                cutoff_k,
+            )
+
+        # RRF utilizzato realmente dalla pipeline
+        rrf_run = rrf_runs_by_k[rrf_k_config]
+
+        # Salviamo i risultati dello sweep per questo dominio
+        all_reports["RRF_sweep"][domain] = {
+            str(k): metrics
+            for k, metrics in rrf_metrics_by_k.items()
+        }
 
         # 4. Selezione Candidati e Re-ranking Neurale
         if ablation_mode in ["A", "B"]:
@@ -458,25 +552,43 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
                         all_scores.extend(scores if isinstance(scores, list) else [scores])
 
                 reranked = sorted([(cands[idx][0], float(all_scores[idx])) for idx in range(len(cands))], key=lambda x: x[1], reverse=True)
-                final_domain_run[sample.topic_id] = reranked[:cutoff_k]
+                final_domain_run[sample.topic_id] = reranked
         else:
             for t_id, cands in candidate_pool.items():
-                final_domain_run[t_id] = cands[:cutoff_k]
+                final_domain_run[t_id] = cands
 
         final_trec_run.update(final_domain_run)
 
-        # Calcolo Diagnostico per tutti i 4 stadi
-        all_reports["Dense"][domain] = compute_detailed_metrics(qrels, dense_run, cutoff_k)
-        all_reports["BM25"][domain] = compute_detailed_metrics(qrels, bm25_run, cutoff_k)
-        all_reports["RRF"][domain] = compute_detailed_metrics(qrels, rrf_run, cutoff_k)
-        all_reports["CrossEncoder"][domain] = compute_detailed_metrics(qrels, final_domain_run, cutoff_k)
+        all_reports["Dense"][domain] = compute_detailed_metrics(
+            qrels,
+            dense_run,
+            cutoff_k
+        )
+
+        all_reports["BM25"][domain] = compute_detailed_metrics(
+            qrels,
+            bm25_run,
+            cutoff_k
+        )
+
+        all_reports["RRF"][domain] = compute_detailed_metrics(
+            qrels,
+            rrf_run,
+            cutoff_k
+        )
+
+        all_reports["Final"][domain] = compute_detailed_metrics(
+            qrels,
+            final_domain_run,
+            cutoff_k
+        )
 
         logger.info(
             f"[{domain:<18}] | "
             f"Dense nDCG@10: {all_reports['Dense'][domain]['nDCG@10']:.4f} | "
             f"BM25: {all_reports['BM25'][domain]['nDCG@10']:.4f} | "
             f"RRF: {all_reports['RRF'][domain]['nDCG@10']:.4f} | "
-            f"Finale: {all_reports['CrossEncoder'][domain]['nDCG@10']:.4f}"
+            f"Finale: {all_reports['Final'][domain]['nDCG@10']:.4f}"
         )
 
     # ---------------------------------------------------------
@@ -486,8 +598,12 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
     logger.info(f"{'STADIO RETRIEVAL':<16} | {'nDCG@10':<10} | {'Recall@10':<10} | {'Recall@50':<10} | {'Recall@100':<10} | {'MRR':<10}")
     logger.info("-" * 80)
 
-    summary_json: Dict[str, Any] = {"per_domain": all_reports, "macro_average": {}}
-    for stage in ["BM25", "Dense", "RRF", "CrossEncoder"]:
+    summary_json: Dict[str, Any] = {
+        "per_domain": all_reports,
+        "macro_average": {},
+        "rrf_sweep_macro_average": {},
+    }
+    for stage in ["BM25", "Dense", "RRF", "Final"]:
         scores = all_reports[stage]
         if not scores:
             continue
@@ -505,6 +621,79 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
             "MRR": macro_mrr,
         }
         logger.info(f"{stage:<16} | {macro_ndcg:<10.4f} | {macro_r10:<10.4f} | {macro_r50:<10.4f} | {macro_r100:<10.4f} | {macro_mrr:<10.4f}")
+
+    # ---------------------------------------------------------
+    # RRF sweep macro-average
+    # ---------------------------------------------------------
+    logger.info("")
+    logger.info(
+        f"{'RRF SWEEP':<16} | "
+        f"{'nDCG@10':<10} | "
+        f"{'Recall@10':<10} | "
+        f"{'Recall@50':<10} | "
+        f"{'Recall@100':<10} | "
+        f"{'MRR':<10}"
+    )
+
+    logger.info("-" * 80)
+
+    for current_k in sorted(rrf_sweep_values):
+        domain_metrics = []
+
+        for domain in all_reports["RRF_sweep"]:
+            metrics = all_reports["RRF_sweep"][domain].get(
+                str(current_k)
+            )
+
+            if metrics:
+                domain_metrics.append(metrics)
+
+        if not domain_metrics:
+            continue
+
+        macro_metrics = {
+            f"nDCG@{cutoff_k}": float(
+                np.mean([
+                    m[f"nDCG@{cutoff_k}"]
+                    for m in domain_metrics
+                ])
+            ),
+            "Recall@10": float(
+                np.mean([
+                    m["Recall@10"]
+                    for m in domain_metrics
+                ])
+            ),
+            "Recall@50": float(
+                np.mean([
+                    m["Recall@50"]
+                    for m in domain_metrics
+                ])
+            ),
+            "Recall@100": float(
+                np.mean([
+                    m["Recall@100"]
+                    for m in domain_metrics
+                ])
+            ),
+            "MRR": float(
+                np.mean([
+                    m["MRR"]
+                    for m in domain_metrics
+                ])
+            ),
+        }
+
+        summary_json["rrf_sweep_macro_average"][str(current_k)] = macro_metrics
+
+        logger.info(
+            f"k={current_k:<13} | "
+            f"{macro_metrics[f'nDCG@{cutoff_k}']:<10.4f} | "
+            f"{macro_metrics['Recall@10']:<10.4f} | "
+            f"{macro_metrics['Recall@50']:<10.4f} | "
+            f"{macro_metrics['Recall@100']:<10.4f} | "
+            f"{macro_metrics['MRR']:<10.4f}"
+        )
 
     logger.info("=" * 80)
 
