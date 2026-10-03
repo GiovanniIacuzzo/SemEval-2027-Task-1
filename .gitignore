@@ -5,3 +5,4 @@ data/
 checkpoints/
 outputs/
 __pycache__/
+*.log

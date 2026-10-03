@@ -31,10 +31,11 @@ from tqdm import tqdm
 
 from dataset.dataset import (
     TRACK2_DOMAINS,
-    OfficialCompatibleBM25,
     ContextAwareQueryFormatter,
     load_track2_domain_data,
 )
+
+from retrieval.retrieval import OfficialBM25
 from models.model import ConversationalBiEncoder, ConversationalCrossEncoder
 from utils.utils import (
     load_config,
@@ -250,21 +251,50 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
         lora_cfg=lora_cfg if use_dense_checkpoint else None,
     ).to(device)
 
-    checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a/bi_encoder"))
-    best_pt = checkpoint_dir / "best_model.pt"
-    best_hf = checkpoint_dir / "best_hf_model"
+    checkpoint_dir = Path(
+        paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a")
+    )
+
+    # Supporta sia:
+    #   checkpoints/subtrack_2a/best_model.pt
+    # sia:
+    #   checkpoints/subtrack_2a/bi_encoder/best_model.pt
+    checkpoint_candidates = [
+        checkpoint_dir / "best_model.pt",
+        checkpoint_dir / "bi_encoder" / "best_model.pt",
+    ]
+
+    best_pt = next((p for p in checkpoint_candidates if p.exists()), checkpoint_candidates[-1])
+
+    best_hf_candidates = [
+        checkpoint_dir / "best_hf_model",
+        checkpoint_dir / "bi_encoder" / "best_hf_model",
+    ]
+
+    best_hf = next(
+        (p for p in best_hf_candidates if (p / "adapter_config.json").exists()),
+        best_hf_candidates[-1],
+    )
 
     if use_dense_checkpoint:
         if best_pt.exists():
-            logger.info(f"Caricamento checkpoint Bi-Encoder da: {best_pt}")
+            logger.info(f"✓ Checkpoint Bi-Encoder trovato: {best_pt}")
             ckpt = torch.load(best_pt, map_location=device)
-            bi_encoder.load_state_dict(ckpt["model_state_dict"], strict=False)
+            bi_encoder.load_state_dict(
+                ckpt["model_state_dict"],
+                strict=False
+            )
+            logger.info("✓ Pesi del Bi-Encoder fine-tuned caricati correttamente.")
         elif (best_hf / "adapter_config.json").exists():
             logger.info(f"Caricamento adapter LoRA da: {best_hf}")
             from peft import PeftModel
             bi_encoder.encoder = PeftModel.from_pretrained(bi_encoder.encoder, str(best_hf))
         else:
-            logger.info(f"Nessun checkpoint trovato in {checkpoint_dir}. Valutazione Bi-Encoder Pretrained.")
+            logger.warning(
+                f"NESSUN CHECKPOINT FINE-TUNED TROVATO. "
+                f"Percorsi controllati: {checkpoint_candidates}. "
+                f"Verrà utilizzato il modello pretrained."
+            )
     else:
         logger.info("Valutazione Bi-Encoder Pretrained (Ablation).")
 
@@ -296,10 +326,17 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
 
     # Inizializzazione Cache Embeddings
     emb_cache = DocumentEmbeddingCache(
-        cache_dir=Path(paths_cfg.get("embedding_cache_dir", "data/cache/document_embeddings")),
-        model_tag=model_name.replace("/", "_") + ("_tuned" if use_dense_checkpoint and best_pt.exists() else "_pre"),
+        cache_dir=Path(
+            paths_cfg.get(
+                "embedding_cache_dir",
+                "data/cache/document_embeddings"
+            )
+        ),
+        model_tag=model_name.replace("/", "_")
+        + ("_tuned" if use_dense_checkpoint and best_pt.exists() else "_pre"),
         pooling=bi_cfg.get("pooling_strategy", "mean"),
         max_len=data_cfg.get("max_doc_length", 256),
+        ckpt_path=best_pt if use_dense_checkpoint and best_pt.exists() else None,
     )
 
     cutoff_k = eval_cfg.get("cutoff_k", 10)
@@ -368,7 +405,7 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
 
         bm25_run = {}
         if sparse_cfg.get("enabled", True):
-            bm25 = OfficialCompatibleBM25(corpus, k1=sparse_cfg.get("k1", 0.9), b=sparse_cfg.get("b", 0.4))
+            bm25 = OfficialBM25(corpus, k1=sparse_cfg.get("k1", 0.9), b=sparse_cfg.get("b", 0.4))
             for sample in samples:
                 if ablation_mode == "A":
                     # Ablation A: Solo turno corrente
@@ -376,7 +413,10 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
                 else:
                     # History completa pulita + Domanda
                     raw_bm25_query = f"{sample.history} {sample.query}".strip()
-                bm25_run[sample.topic_id] = bm25.get_top_k(raw_bm25_query, top_k=top_candidates)
+                bm25_run[sample.topic_id] = bm25.search_one(
+                    query=raw_bm25_query,
+                    top_k=top_candidates
+                )
 
         # 3. Fusione Reciprocal Rank Fusion (RRF)
         rrf_run = reciprocal_rank_fusion([dense_run, bm25_run], k=rrf_k, top_n=top_candidates)

@@ -2,31 +2,42 @@
 """
 subtrack_2a/dataset/dataset.py
 
-Modulo di gestione dati robusto per SemEval-2027 Sub-track 2a (RECOR).
-Garantisce:
-  - Context-Aware Query Truncation: la current question è prioritaria e non viene mai troncata.
-  - Multi-positive fix: 1 istanza per turno conversazionale, rotazione deterministica del target positivo.
-  - Esclusione rigorosa di TUTTI i gold document del topic dai negativi.
-  - Mining di K Hard Negatives tramite BM25 conforme alle baseline ufficiali (k1=0.9, b=0.4).
-  - Statistiche diagnostiche su token e lunghezze.
+Data pipeline per RETECO SemEval-2027 Sub-track 2a.
+
+Responsabilità del modulo:
+    1. Rappresentazione dei turni conversazionali.
+    2. Costruzione deterministica di query + conversation history.
+    3. Caricamento di corpus, benchmark e qrels.
+    4. PyTorch Dataset per il contrastive training.
+    5. Collate function per query/positive/negative.
+    6. Domain-balanced batch sampler.
+
+Il retrieval BM25 e il mining degli hard negatives sono implementati
+separatamente in:
+    subtrack_2a/retrieval/retrieval.py
+
+Nota:
+    Gli ID dei documenti vengono mantenuti esattamente come nel dataset.
+    Il dominio è memorizzato separatamente e non viene concatenato agli ID.
 """
 
-import os
-import re
+from __future__ import annotations
+
 import json
-import math
 import random
-import logging
 import collections
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import Dataset, Sampler
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerBase
 
-logger = logging.getLogger("RETECO_Dataset")
+
+# =============================================================================
+# Costanti
+# =============================================================================
 
 TRACK2_DOMAINS = [
     "biology",
@@ -43,291 +54,661 @@ TRACK2_DOMAINS = [
 ]
 
 
+# =============================================================================
+# Data structures
+# =============================================================================
+
 @dataclass
 class ConversationalTurnSample:
-    """Rappresentazione unificata di un turno conversazionale."""
+    """
+    Rappresenta un singolo turno del benchmark RETECO Track 2a.
+
+    topic_id:
+        Identificatore usato nel run TREC e nei qrels.
+
+    contextual_query:
+        Testo effettivamente passato al retriever:
+        query corrente + history eventualmente formattata/troncata.
+    """
+
     domain: str
     conversation_id: str
     turn_id: int
     topic_id: str
+
     query: str
     history: str
     contextual_query: str
+
     gold_doc_ids: List[str]
-    answer: Optional[str] = None
 
 
-# ==============================================================================
-# 1. Context-Aware Query Truncation con Calcolo Esplicito del Budget
-# ==============================================================================
+# =============================================================================
+# Query formatting
+# =============================================================================
+
 class ContextAwareQueryFormatter:
     """
-    Costruzione deterministica del contesto a budget.
-    La domanda corrente ha priorità assoluta di allocazione token.
-    La cronologia viene aggiunta a ritroso per turni interi dal più recente al più vecchio.
+    Costruisce la query di retrieval rispettando un budget token.
+
+    Strategie supportate:
+        - query_only
+        - history
+        - budget_context   (alias di history)
+        - concat           (alias di history)
+
+    La query corrente ha sempre priorità.
+    Se la history supera il budget residuo, viene mantenuta la parte finale
+    della history, cioè quella più recente.
+
+    Non viene fatto parsing artificiale di "User:", "Assistant:", "Q:", "A:".
+    La history viene trattata come testo già formattato dal benchmark.
     """
+
+    HISTORY_ALIASES = {"history", "budget_context", "concat"}
 
     def __init__(
         self,
-        tokenizer: AutoTokenizer,
-        max_query_length: int = 256,
+        tokenizer: PreTrainedTokenizerBase,
+        max_query_length: int = 512,
         query_instruction: str = "",
-        strategy: str = "budget_context",
+        strategy: str = "history",
     ):
+        if max_query_length <= 0:
+            raise ValueError("max_query_length deve essere > 0.")
+
+        strategy = strategy.lower().strip()
+
+        if strategy not in {"query_only", *self.HISTORY_ALIASES}:
+            raise ValueError(
+                f"Strategia query non valida: {strategy}. "
+                f"Usa query_only, history, budget_context oppure concat."
+            )
+
         self.tokenizer = tokenizer
-        self.max_query_length = max_query_length
+        self.max_query_length = int(max_query_length)
         self.query_instruction = query_instruction.strip()
         self.strategy = strategy
 
         self.stats = {
             "total_queries": 0,
             "question_truncated": 0,
-            "history_fully_retained": 0,
-            "history_partially_retained": 0,
-            "raw_q_tokens": 0,
-            "raw_hist_tokens": 0,
-            "retained_hist_tokens": 0,
+            "history_used": 0,
+            "history_truncated": 0,
+            "raw_query_tokens": 0,
+            "raw_history_tokens": 0,
+            "retained_history_tokens": 0,
             "final_tokens": 0,
         }
 
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+
+    def _count_tokens(self, text: str) -> int:
+        return len(
+            self.tokenizer.encode(
+                text,
+                add_special_tokens=False,
+            )
+        )
+
+    def _truncate_query_to_budget(self, query: str, budget: int) -> str:
+        """
+        Trunca la query solo nel caso estremo in cui non entri nemmeno
+        senza history.
+
+        Conserviamo i primi `budget` token. Nella pratica RETECO le query
+        dovrebbero essere molto più corte di questo limite.
+        """
+        if budget <= 0:
+            return ""
+
+        ids = self.tokenizer.encode(
+            query,
+            add_special_tokens=False,
+        )
+
+        if len(ids) <= budget:
+            return query
+
+        self.stats["question_truncated"] += 1
+
+        truncated = self.tokenizer.decode(
+            ids[:budget],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        ).strip()
+
+        return truncated
+
+    def _truncate_history_from_left(self, history: str, budget: int) -> str:
+        """
+        Mantiene gli ultimi `budget` token della history.
+
+        In caso di history molto lunga preferiamo sacrificare i turni più
+        vecchi piuttosto che interrompere la query corrente.
+        """
+        if budget <= 0 or not history:
+            return ""
+
+        history_ids = self.tokenizer.encode(
+            history,
+            add_special_tokens=False,
+        )
+
+        if len(history_ids) <= budget:
+            return history
+
+        self.stats["history_truncated"] += 1
+
+        retained_ids = history_ids[-budget:]
+
+        retained = self.tokenizer.decode(
+            retained_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        ).strip()
+
+        return retained
+
+    # -------------------------------------------------------------------------
+    # Main formatter
+    # -------------------------------------------------------------------------
+
     def format(self, query: str, history: str) -> str:
         self.stats["total_queries"] += 1
-        query_clean = query.strip()
-        history_clean = history.strip() if history else ""
-        if history_clean.lower() == "no previous conversation.":
-            history_clean = ""
 
-        prefix = f"{self.query_instruction} " if self.query_instruction else ""
+        query = (query or "").strip()
+        history = (history or "").strip()
 
-        # Diagnostica token grezzi
-        q_raw_toks = self.tokenizer.tokenize(query_clean)
-        self.stats["raw_q_tokens"] += len(q_raw_toks)
+        if history.lower() == "no previous conversation.":
+            history = ""
 
-        if self.strategy == "query_only" or not history_clean:
-            formatted = f"{prefix}Current Question: {query_clean}"
-            final_toks = self.tokenizer.tokenize(formatted)
-            self.stats["final_tokens"] += min(len(final_toks), self.max_query_length)
-            return formatted
+        self.stats["raw_query_tokens"] += self._count_tokens(query)
 
-        hist_raw_toks = self.tokenizer.tokenize(history_clean)
-        self.stats["raw_hist_tokens"] += len(hist_raw_toks)
+        if history:
+            self.stats["raw_history_tokens"] += self._count_tokens(history)
 
-        header_q = f"{prefix}Current Question: {query_clean}\n\nConversation History:\n"
-        header_toks = self.tokenizer.tokenize(header_q)
-        header_len = len(header_toks)
+        instruction = self.query_instruction
+        prefix = f"{instruction} " if instruction else ""
 
-        # Se la sola domanda satura o eccede il budget massimo
-        if header_len >= self.max_query_length:
-            self.stats["question_truncated"] += 1
-            self.stats["final_tokens"] += self.max_query_length
-            # Troncatura protetta della sola domanda
-            return f"{prefix}Current Question: {query_clean}"
+        # ------------------------------------------------------------------
+        # Query only
+        # ------------------------------------------------------------------
+        if self.strategy == "query_only" or not history:
+            raw = f"{prefix}{query}"
 
-        residual_budget = self.max_query_length - header_len
+            if self._count_tokens(raw) > self.max_query_length:
+                available = max(
+                    1,
+                    self.max_query_length - self._count_tokens(prefix),
+                )
+                query = self._truncate_query_to_budget(query, available)
+                raw = f"{prefix}{query}"
 
-        # Suddivisione della cronologia in turni/blocchi logici
-        # Identifica pattern 'User:', 'Assistant:', 'Q:', 'A:' o linee multiple
-        turn_delimiters = re.split(r"(?=(?:User:|Assistant:|Q:|A:|\n\n))", history_clean)
-        turns = [t.strip() for t in turn_delimiters if t.strip()]
+            final_len = self._count_tokens(raw)
 
-        if not turns:
-            turns = [history_clean]
+            self.stats["final_tokens"] += min(
+                final_len,
+                self.max_query_length,
+            )
 
-        retained_turns = []
-        accumulated_tokens = 0
+            return raw.strip()
 
-        # Inclusione a ritroso dal turno più recente verso il più vecchio
-        for turn in reversed(turns):
-            turn_toks = self.tokenizer.tokenize(turn)
-            if accumulated_tokens + len(turn_toks) <= residual_budget:
-                retained_turns.append(turn)
-                accumulated_tokens += len(turn_toks)
-            else:
-                break
+        # ------------------------------------------------------------------
+        # Query + history
+        # ------------------------------------------------------------------
 
-        if len(retained_turns) == len(turns):
-            self.stats["history_fully_retained"] += 1
-        elif len(retained_turns) > 0:
-            self.stats["history_partially_retained"] += 1
+        query_part = f"{prefix}{query}".strip()
+        history_header = "\n\nConversation History:\n"
 
-        self.stats["retained_hist_tokens"] += accumulated_tokens
-        self.stats["final_tokens"] += header_len + accumulated_tokens
+        # Quanto occupano query + header?
+        fixed_text = f"{query_part}{history_header}"
+        fixed_len = self._count_tokens(fixed_text)
 
-        # Ricomponi la cronologia nell'ordine temporale naturale
-        reconstructed_history = "\n".join(reversed(retained_turns))
-        return f"{header_q}{reconstructed_history}".strip()
+        # Caso estremo: query troppo lunga anche senza history.
+        if fixed_len > self.max_query_length:
+            available_for_query = max(
+                1,
+                self.max_query_length
+                - self._count_tokens(prefix)
+                - self._count_tokens(history_header),
+            )
+
+            query = self._truncate_query_to_budget(
+                query,
+                available_for_query,
+            )
+
+            query_part = f"{prefix}{query}".strip()
+            fixed_text = f"{query_part}{history_header}"
+            fixed_len = self._count_tokens(fixed_text)
+
+        residual_budget = max(
+            0,
+            self.max_query_length - fixed_len,
+        )
+
+        retained_history = self._truncate_history_from_left(
+            history,
+            residual_budget,
+        )
+
+        if retained_history:
+            self.stats["history_used"] += 1
+            retained_history_tokens = self._count_tokens(retained_history)
+            self.stats["retained_history_tokens"] += retained_history_tokens
+        else:
+            retained_history_tokens = 0
+
+        formatted = f"{fixed_text}{retained_history}".strip()
+
+        final_len = self._count_tokens(formatted)
+
+        self.stats["final_tokens"] += min(
+            final_len,
+            self.max_query_length,
+        )
+
+        return formatted
+
+    # -------------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------------
 
     def get_diagnostics(self) -> Dict[str, float]:
         n = max(1, self.stats["total_queries"])
+
         return {
-            "total_queries": self.stats["total_queries"],
-            "pct_question_truncated": (self.stats["question_truncated"] / n) * 100.0,
-            "pct_hist_full": (self.stats["history_fully_retained"] / n) * 100.0,
-            "pct_hist_partial": (self.stats["history_partially_retained"] / n) * 100.0,
-            "avg_raw_q_tokens": self.stats["raw_q_tokens"] / n,
-            "avg_raw_hist_tokens": self.stats["raw_hist_tokens"] / n,
-            "avg_retained_hist_tokens": self.stats["retained_hist_tokens"] / n,
-            "avg_final_tokens": self.stats["final_tokens"] / n,
+            "total_queries": float(self.stats["total_queries"]),
+            "pct_question_truncated": (
+                100.0 * self.stats["question_truncated"] / n
+            ),
+            "pct_history_used": (
+                100.0 * self.stats["history_used"] / n
+            ),
+            "pct_history_truncated": (
+                100.0 * self.stats["history_truncated"] / n
+            ),
+            "avg_raw_query_tokens": (
+                self.stats["raw_query_tokens"] / n
+            ),
+            "avg_raw_history_tokens": (
+                self.stats["raw_history_tokens"] / n
+            ),
+            "avg_retained_history_tokens": (
+                self.stats["retained_history_tokens"] / n
+            ),
+            "avg_final_tokens": (
+                self.stats["final_tokens"] / n
+            ),
         }
 
 
-# ==============================================================================
-# 2. Motore BM25 Compatibile con Benchmark Ufficiale
-# ==============================================================================
-def simple_porter_stem(word: str) -> str:
-    """Stemmer di Porter leggero integrato (zero dipendenze esterne)."""
-    if len(word) <= 2:
-        return word
-    if word.endswith("sses"):
-        word = word[:-2]
-    elif word.endswith("ies"):
-        word = word[:-2]
-    elif word.endswith("ss"):
-        pass
-    elif word.endswith("s"):
-        word = word[:-1]
+# =============================================================================
+# Corpus / benchmark / qrels loaders
+# =============================================================================
 
-    if word.endswith("eed"):
-        if len(word) > 4:
-            word = word[:-1]
-    elif word.endswith("ed") and any(c in "aeiou" for c in word[:-2]):
-        word = word[:-2]
-    elif word.endswith("ing") and any(c in "aeiou" for c in word[:-3]):
-        word = word[:-3]
-    return word
-
-
-BM25_STOPWORDS = {
-    "i", "me", "my", "we", "our", "you", "your", "he", "him", "she", "her", "it", "its", "they", "them",
-    "what", "which", "who", "this", "that", "am", "is", "are", "was", "were", "be", "been", "have", "has",
-    "had", "do", "does", "did", "a", "an", "the", "and", "but", "if", "or", "because", "as", "until", "while",
-    "of", "at", "by", "for", "with", "about", "between", "into", "through", "during", "before", "after",
-    "above", "below", "to", "from", "in", "out", "on", "off", "then", "once", "here", "there", "when", "where",
-    "why", "how", "all", "any", "both", "each", "few", "more", "most", "other", "some", "such", "no", "nor",
-    "not", "only", "own", "same", "so", "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now",
-    "current", "question", "conversation", "history", "previous"
-}
-
-
-def bm25_tokenize(text: str) -> List[str]:
-    """Tokenizzazione Lucene-like: regex alfanumerica + stopword removal + stemming."""
-    words = re.findall(r"[a-zA-Z0-9]+", text.lower())
-    return [simple_porter_stem(w) for w in words if w not in BM25_STOPWORDS and len(w) > 1]
-
-
-class OfficialCompatibleBM25:
-    """BM25 Invertito conforme ai parametri ufficiali del benchmark (k1=0.9, b=0.4)."""
-
-    def __init__(self, corpus: Dict[str, str], k1: float = 0.9, b: float = 0.4):
-        self.k1 = k1
-        self.b = b
-        self.doc_ids = list(corpus.keys())
-        self.N = len(self.doc_ids)
-        self.doc_len: Dict[int, int] = {}
-        self.inv_index = collections.defaultdict(list)
-        total_len = 0
-
-        for idx, d_id in enumerate(self.doc_ids):
-            tokens = bm25_tokenize(corpus[d_id])
-            l = len(tokens)
-            self.doc_len[idx] = l
-            total_len += l
-            tf_map = collections.Counter(tokens)
-            for term, freq in tf_map.items():
-                self.inv_index[term].append((idx, freq))
-
-        self.avgdl = (total_len / self.N) if self.N > 0 else 1.0
-        self.idf = {
-            term: math.log((self.N - len(postings) + 0.5) / (len(postings) + 0.5) + 1.0)
-            for term, postings in self.inv_index.items()
-        }
-
-    def get_top_k(self, query: str, top_k: int = 100) -> List[Tuple[str, float]]:
-        q_tokens = bm25_tokenize(query)
-        if not q_tokens:
-            return []
-        scores = collections.defaultdict(float)
-        for term in q_tokens:
-            if term in self.inv_index:
-                term_idf = self.idf[term]
-                for doc_idx, tf in self.inv_index[term]:
-                    num = tf * (self.k1 + 1.0)
-                    den = tf + self.k1 * (1.0 - self.b + self.b * (self.doc_len[doc_idx] / self.avgdl))
-                    scores[doc_idx] += term_idf * (num / den)
-        if not scores:
-            return []
-        ranked_indices = sorted(scores.keys(), key=lambda i: scores[i], reverse=True)[:top_k]
-        return [(self.doc_ids[i], float(scores[i])) for i in ranked_indices]
-
-def mine_bm25_hard_negatives(
-    corpus: Dict[str, str],
-    samples: List[ConversationalTurnSample],
-    top_k: int = 20,
-    k1: float = 0.9,
-    b: float = 0.4,
-    domain_prefix: str = "",
-    cache_dir: Optional[Path] = None,
-) -> Dict[str, List[str]]:
+def load_corpus(
+    documents_path: Union[str, Path],
+) -> Dict[str, str]:
     """
-    Estrae i negativi BM25 per ciascun turno escludendo rigorosamente
-    tutti i gold document del topic.
+    Carica documents.jsonl nel formato:
+        {"doc_id": "...", "content": "..."}
     """
-    if cache_dir is not None:
-        cache_dir = Path(cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file = cache_dir / f"hard_negs_bm25_{domain_prefix}_top{top_k}.json"
-        if cache_file.exists():
+    path = Path(documents_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Corpus non trovato: {path}")
+
+    corpus: Dict[str, str] = {}
+
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+
+            if not line:
+                continue
+
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"JSON non valido in {path}, riga {line_no}"
+                ) from exc
 
-    bm25 = OfficialCompatibleBM25(corpus, k1=k1, b=b)
-    hard_negatives_map: Dict[str, List[str]] = {}
+            doc_id = item.get("doc_id", item.get("id"))
+            text = item.get("content", item.get("text", ""))
 
-    for s in samples:
-        gold_set = set(s.gold_doc_ids)
-        if domain_prefix:
-            gold_set.update(f"{domain_prefix}_{gid}" for gid in s.gold_doc_ids)
+            if doc_id is None:
+                raise ValueError(
+                    f"Documento senza ID in {path}, riga {line_no}"
+                )
 
-        # Recupera un numero congruo di candidati per compensare i gold filtrati
-        candidates = bm25.get_top_k(s.contextual_query, top_k=top_k + len(gold_set) + 10)
-        negatives: List[str] = []
+            doc_id = str(doc_id)
+            text = str(text or "").strip()
 
-        for doc_id, score in candidates:
-            target_id = f"{domain_prefix}_{doc_id}" if domain_prefix and not doc_id.startswith(f"{domain_prefix}_") else doc_id
-            raw_id = doc_id.split(f"{domain_prefix}_")[-1]
+            if not text:
+                continue
 
-            # Controllo rigoroso anti-false negatives
-            if target_id not in gold_set and raw_id not in gold_set and target_id not in negatives:
-                negatives.append(target_id)
-                if len(negatives) >= top_k:
-                    break
+            corpus[doc_id] = text
 
-        hard_negatives_map[s.topic_id] = negatives
+    if not corpus:
+        raise ValueError(f"Corpus vuoto: {path}")
 
-    if cache_dir is not None:
+    return corpus
+
+
+def load_qrels(
+    qrels_path: Union[str, Path],
+) -> Dict[str, Dict[str, int]]:
+    """
+    Carica qrels in formato TREC:
+
+        topic_id  0  doc_id  relevance
+    """
+    path = Path(qrels_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Qrels non trovati: {path}")
+
+    qrels: Dict[str, Dict[str, int]] = {}
+
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            parts = line.strip().split()
+
+            if not parts:
+                continue
+
+            if len(parts) < 4:
+                raise ValueError(
+                    f"Qrels malformati in {path}, riga {line_no}: {line}"
+                )
+
+            topic_id, _, doc_id, relevance = parts[:4]
+
+            qrels.setdefault(topic_id, {})[doc_id] = int(relevance)
+
+    return qrels
+
+
+def _load_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
+    """
+    Supporta sia un singolo array JSON sia JSONL.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        raw = f.read().strip()
+
+    if not raw:
+        return []
+
+    if raw.startswith("["):
+        data = json.loads(raw)
+
+        if not isinstance(data, list):
+            raise ValueError(f"Formato JSON inatteso in {path}")
+
+        return data
+
+    records = []
+
+    for line_no, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+
+        if not line:
+            continue
+
         try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(hard_negatives_map, f)
-        except Exception:
-            pass
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"JSON non valido in {path}, riga {line_no}"
+            ) from exc
 
-    return hard_negatives_map
+    return records
 
 
-# ==============================================================================
-# 3. PyTorch Dataset & Collate Function
-# ==============================================================================
+def load_benchmark_conversations(
+    benchmark_path: Union[str, Path],
+    domain: str,
+    formatter: ContextAwareQueryFormatter,
+) -> List[ConversationalTurnSample]:
+    """
+    Carica benchmark_{split}.json e lo appiattisce in una lista di turni.
+    """
+    path = Path(benchmark_path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Benchmark non trovato: {path}"
+        )
+
+    conversations = _load_json_or_jsonl(path)
+
+    samples: List[ConversationalTurnSample] = []
+
+    for conversation in conversations:
+        conversation_id = str(conversation["id"])
+
+        for turn in conversation.get("turns", []):
+            turn_id = int(turn["turn_id"])
+
+            query = str(turn.get("query", "")).strip()
+            history = str(
+                turn.get("conversation_history", "") or ""
+            ).strip()
+
+            gold_doc_ids = [
+                str(doc_id)
+                for doc_id in (
+                    turn.get("gold_doc_ids")
+                    or turn.get("supporting_doc_ids")
+                    or []
+                )
+            ]
+
+            topic_id = f"{conversation_id}_turn_{turn_id}"
+
+            contextual_query = formatter.format(
+                query=query,
+                history=history,
+            )
+
+            samples.append(
+                ConversationalTurnSample(
+                    domain=domain,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    topic_id=topic_id,
+                    query=query,
+                    history=history,
+                    contextual_query=contextual_query,
+                    gold_doc_ids=gold_doc_ids,
+                )
+            )
+
+    return samples
+
+
+def load_track2_domain_data(
+    data_dir: Union[str, Path],
+    domain: str,
+    split: str = "train",
+    formatter: Optional[ContextAwareQueryFormatter] = None,
+) -> Tuple[
+    Dict[str, str],
+    List[ConversationalTurnSample],
+    Dict[str, Dict[str, int]],
+]:
+    """
+    Carica un dominio RETECO Track 2a.
+
+    Struttura attesa:
+
+        data_dir/
+            domain/
+                documents.jsonl
+                benchmark_train.json
+                benchmark_dev.json
+                qrels_train.txt
+                qrels_dev.txt
+    """
+    root = Path(data_dir)
+
+    domain_dir = root / domain
+
+    if not domain_dir.exists():
+        raise FileNotFoundError(
+            f"Cartella dominio non trovata: {domain_dir}"
+        )
+
+    documents_path = domain_dir / "documents.jsonl"
+
+    benchmark_path = domain_dir / f"benchmark_{split}.json"
+    if not benchmark_path.exists():
+        benchmark_path = domain_dir / f"benchmark_{split}.jsonl"
+
+    qrels_path = domain_dir / f"qrels_{split}.txt"
+
+    corpus = load_corpus(documents_path)
+
+    if not benchmark_path.exists():
+        raise FileNotFoundError(
+            f"Benchmark {split} non trovato per il dominio "
+            f"{domain}: {benchmark_path}"
+        )
+
+    if not qrels_path.exists():
+        raise FileNotFoundError(
+            f"Qrels {split} non trovati per il dominio "
+            f"{domain}: {qrels_path}"
+        )
+
+    if formatter is None:
+        formatter = ContextAwareQueryFormatter(
+            tokenizer=None,  # type: ignore[arg-type]
+            max_query_length=512,
+            strategy="history",
+        )
+
+        # Questo ramo esiste solo come fallback difensivo.
+        # In produzione passeremo sempre un tokenizer reale.
+        def _fallback_format(query: str, history: str) -> str:
+            history = history.strip()
+            if history.lower() == "no previous conversation.":
+                history = ""
+
+            if not history:
+                return query.strip()
+
+            return (
+                f"{query.strip()}\n\n"
+                f"Conversation History:\n"
+                f"{history}"
+            )
+
+        formatter.format = _fallback_format  # type: ignore[method-assign]
+
+    samples = load_benchmark_conversations(
+        benchmark_path=benchmark_path,
+        domain=domain,
+        formatter=formatter,
+    )
+
+    qrels = load_qrels(qrels_path)
+
+    return corpus, samples, qrels
+
+
+# =============================================================================
+# Conversation-level split
+# =============================================================================
+
+def split_conversations_train_val(
+    samples: List[ConversationalTurnSample],
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> Tuple[
+    List[ConversationalTurnSample],
+    List[ConversationalTurnSample],
+]:
+    """
+    Split train/validation a livello di conversazione.
+
+    Nessuna conversazione viene spezzata tra train e validation.
+    Questo evita leakage tra turni della stessa conversazione.
+    """
+    if not samples:
+        return [], []
+
+    if not (0.0 < val_ratio < 1.0):
+        raise ValueError(
+            f"val_ratio deve essere compreso tra 0 e 1: {val_ratio}"
+        )
+
+    conversation_ids = sorted(
+        {sample.conversation_id for sample in samples}
+    )
+
+    rng = random.Random(seed)
+    rng.shuffle(conversation_ids)
+
+    n_val = max(
+        1,
+        int(round(len(conversation_ids) * val_ratio)),
+    )
+
+    if n_val >= len(conversation_ids):
+        n_val = len(conversation_ids) - 1
+
+    val_conversation_ids = set(
+        conversation_ids[:n_val]
+    )
+
+    train_samples = [
+        sample
+        for sample in samples
+        if sample.conversation_id not in val_conversation_ids
+    ]
+
+    val_samples = [
+        sample
+        for sample in samples
+        if sample.conversation_id in val_conversation_ids
+    ]
+
+    return train_samples, val_samples
+
+
+# =============================================================================
+# PyTorch training dataset
+# =============================================================================
 
 class RETECO2aTrainDataset(Dataset):
     """
-    Dataset contrastivo:
-      - 1 sola istanza per target turn (risolve il multi-positive collision).
-      - Rotazione deterministica del positivo tra epoche.
-      - Supporto a K negativi multipli escludendo rigorosamente tutti i gold.
+    Dataset contrastivo per Sub-track 2a.
+
+    Per ogni turno:
+        query
+        positive
+        K negatives
+
+    Quando un topic ha più gold documents, il positive viene ruotato
+    deterministicamente tra le epoche.
+
+    Gli hard negatives vengono forniti dall'esterno tramite:
+        hard_negatives[topic_id] -> [doc_id, ...]
+
+    Il dataset non esegue BM25.
     """
+
+    VALID_STRATEGIES = {
+        "bm25_hard",
+        "mixed",
+        "random",
+    }
 
     def __init__(
         self,
@@ -338,294 +719,497 @@ class RETECO2aTrainDataset(Dataset):
         sampling_strategy: str = "bm25_hard",
         seed: int = 42,
     ):
+        super().__init__()
+
+        if not corpus:
+            raise ValueError("Il corpus di training è vuoto.")
+
+        sampling_strategy = sampling_strategy.lower().strip()
+
+        if sampling_strategy not in self.VALID_STRATEGIES:
+            raise ValueError(
+                f"Strategia negative sampling non valida: "
+                f"{sampling_strategy}"
+            )
+
         self.corpus = corpus
         self.corpus_keys = list(corpus.keys())
-        self.negatives_per_positive = max(1, negatives_per_positive)
+
+        self.negatives_per_positive = max(
+            1,
+            int(negatives_per_positive),
+        )
+
         self.hard_negatives = hard_negatives or {}
         self.sampling_strategy = sampling_strategy
-        self.epoch = 0
-        self.rng = random.Random(seed)
 
-        # Filtra i turni mantenendo 1 campione per turno
+        self.seed = int(seed)
+        self.epoch = 0
+
         self.valid_samples: List[ConversationalTurnSample] = []
-        for s in samples:
-            valid_golds = [gid for gid in s.gold_doc_ids if gid in self.corpus]
+
+        for sample in samples:
+            valid_golds = [
+                doc_id
+                for doc_id in sample.gold_doc_ids
+                if doc_id in self.corpus
+            ]
+
             if valid_golds:
-                s.gold_doc_ids = valid_golds
-                self.valid_samples.append(s)
+                # Copia del sample per non modificare l'oggetto originale.
+                self.valid_samples.append(
+                    ConversationalTurnSample(
+                        domain=sample.domain,
+                        conversation_id=sample.conversation_id,
+                        turn_id=sample.turn_id,
+                        topic_id=sample.topic_id,
+                        query=sample.query,
+                        history=sample.history,
+                        contextual_query=sample.contextual_query,
+                        gold_doc_ids=valid_golds,
+                    )
+                )
 
         if not self.valid_samples:
-            raise ValueError("Nessun turno valido trovato con documenti presenti nel corpus.")
+            raise ValueError(
+                "Nessun training sample valido: "
+                "nessun gold document è presente nel corpus."
+            )
 
-    def set_epoch(self, epoch: int):
-        """Aggiorna l'epoca per la rotazione deterministica dei positivi."""
-        self.epoch = epoch
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
     def __len__(self) -> int:
         return len(self.valid_samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.valid_samples[idx]
-        topic_id = sample.topic_id
-        golds = sample.gold_doc_ids
-        gold_set = set(golds)
+    # -------------------------------------------------------------------------
+    # Negative sampling
+    # -------------------------------------------------------------------------
 
-        # 1. Rotazione deterministica del positivo: un solo gold alla volta
-        pos_idx = (self.epoch + idx) % len(golds)
-        pos_id = golds[pos_idx]
-        pos_text = self.corpus[pos_id]
+    def _random_negative_ids(
+        self,
+        gold_ids: set[str],
+        excluded: set[str],
+        n: int,
+        idx: int,
+    ) -> List[str]:
+        """
+        Sampling deterministico ma diverso per esempio/epoca.
+        """
+        if n <= 0:
+            return []
 
-        # 2. Selezione di K Hard Negatives escludendo TUTTI i gold document del topic
-        selected_neg_ids: List[str] = []
-        bm25_candidates = [
-            nid for nid in self.hard_negatives.get(topic_id, [])
-            if nid in self.corpus and nid not in gold_set
+        available = [
+            doc_id
+            for doc_id in self.corpus_keys
+            if doc_id not in gold_ids
+            and doc_id not in excluded
         ]
 
-        if self.sampling_strategy == "bm25_hard" and bm25_candidates:
-            # Prende i candidati senza duplicati
-            for nid in bm25_candidates:
-                if nid not in selected_neg_ids:
-                    selected_neg_ids.append(nid)
-                if len(selected_neg_ids) >= self.negatives_per_positive:
-                    break
+        if not available:
+            return []
 
-        # Fallback deterministico con negativi casuali se i BM25 scarseggiano
-        attempts = 0
-        while len(selected_neg_ids) < self.negatives_per_positive and attempts < 1000:
-            attempts += 1
-            rand_id = self.corpus_keys[self.rng.randint(0, len(self.corpus_keys) - 1)]
-            if rand_id not in gold_set and rand_id not in selected_neg_ids:
-                selected_neg_ids.append(rand_id)
-
-        neg_texts = [self.corpus[nid] for nid in selected_neg_ids]
-
-        return {
-            "topic_id": topic_id,
-            "domain": sample.domain,
-            "query": sample.contextual_query,
-            "positive": pos_text,
-            "negatives": neg_texts,
-            "pos_id": pos_id,
-            "neg_ids": selected_neg_ids,
-        }
-
-
-class ConversationalCollateFn:
-    """Collate function che tokenizza query, positivo e K negativi multipli."""
-
-    def __init__(self, tokenizer: AutoTokenizer, max_query_len: int = 256, max_doc_len: int = 256):
-        self.tokenizer = tokenizer
-        self.max_query_len = max_query_len
-        self.max_doc_len = max_doc_len
-
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        queries = [item["query"] for item in batch]
-        positives = [item["positive"] for item in batch]
-        
-        # Gestione negativi multipli: appiattimento per tokenizzazione batch
-        batch_size = len(batch)
-        k_negs = len(batch[0]["negatives"])
-        flat_negatives = [neg for item in batch for neg in item["negatives"]]
-
-        q_tok = self.tokenizer(
-            queries, padding=True, truncation=True, max_length=self.max_query_len, return_tensors="pt"
-        )
-        pos_tok = self.tokenizer(
-            positives, padding=True, truncation=True, max_length=self.max_doc_len, return_tensors="pt"
-        )
-        neg_tok = self.tokenizer(
-            flat_negatives, padding=True, truncation=True, max_length=self.max_doc_len, return_tensors="pt"
+        rng = random.Random(
+            self.seed
+            + self.epoch * 1_000_003
+            + idx * 9_176
         )
 
-        return {
-            "query_inputs": q_tok,
-            "pos_inputs": pos_tok,
-            "neg_inputs": neg_tok,
-            "batch_size": batch_size,
-            "k_negs": k_negs,
-        }
+        if len(available) <= n:
+            rng.shuffle(available)
+            return available
 
+        return rng.sample(available, n)
 
-# ==============================================================================
-# 4. Sampler Bilanciato per Dominio
-# ==============================================================================
+    def _select_negatives(
+        self,
+        sample: ConversationalTurnSample,
+        idx: int,
+    ) -> List[str]:
+        gold_ids = set(sample.gold_doc_ids)
 
-class DomainBalancedBatchSampler(Sampler):
-    """Sampler che garantisce un campionamento bilanciato tra i domini di training."""
+        hard_ids = []
+        seen = set(gold_ids)
 
-    def __init__(self, samples: List[ConversationalTurnSample], batch_size: int, seed: int = 42):
-        self.batch_size = batch_size
-        self.rng = random.Random(seed)
-        self.domain_to_indices = collections.defaultdict(list)
-        for idx, s in enumerate(samples):
-            self.domain_to_indices[s.domain].append(idx)
-        self.domains = list(self.domain_to_indices.keys())
-        self.total_samples = len(samples)
-
-    def __iter__(self):
-        # Mescola gli indici all'interno di ogni dominio
-        domain_pools = {d: self.rng.sample(idxs, len(idxs)) for d, idxs in self.domain_to_indices.items()}
-        domain_ptrs = {d: 0 for d in self.domains}
-
-        batches = []
-        current_batch = []
-        d_idx = 0
-
-        while len(batches) * self.batch_size < self.total_samples:
-            dom = self.domains[d_idx % len(self.domains)]
-            d_idx += 1
-
-            if domain_ptrs[dom] >= len(domain_pools[dom]):
-                domain_pools[dom] = self.rng.sample(self.domain_to_indices[dom], len(self.domain_to_indices[dom]))
-                domain_ptrs[dom] = 0
-
-            sample_idx = domain_pools[dom][domain_ptrs[dom]]
-            domain_ptrs[dom] += 1
-            current_batch.append(sample_idx)
-
-            if len(current_batch) == self.batch_size:
-                batches.append(current_batch)
-                current_batch = []
-
-        return iter(batches)
-
-    def __len__(self) -> int:
-        return self.total_samples // self.batch_size
-
-
-# ==============================================================================
-# 5. Funzioni di Supporto per il Caricamento Dati
-# ==============================================================================
-
-def load_corpus(documents_path: Union[str, Path]) -> Dict[str, str]:
-    documents_path = Path(documents_path)
-    if not documents_path.exists():
-        raise FileNotFoundError(f"Corpus non trovato: {documents_path}")
-    corpus: Dict[str, str] = {}
-    with open(documents_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+        for doc_id in self.hard_negatives.get(sample.topic_id, []):
+            if doc_id not in self.corpus:
                 continue
-            item = json.loads(line)
-            doc_id = str(item.get("doc_id") or item.get("id"))
-            text = item.get("content") or item.get("text") or ""
-            corpus[doc_id] = text.strip()
-    return corpus
 
+            if doc_id in seen:
+                continue
 
-def load_qrels(qrels_path: Union[str, Path]) -> Dict[str, Dict[str, int]]:
-    qrels_path = Path(qrels_path)
-    if not qrels_path.exists():
-        return {}
-    qrels: Dict[str, Dict[str, int]] = {}
-    with open(qrels_path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 4:
-                t_id, _, d_id, rel = parts[0], parts[1], parts[2], parts[3]
-                qrels.setdefault(t_id, {})[d_id] = int(rel)
-    return qrels
+            hard_ids.append(doc_id)
+            seen.add(doc_id)
 
+        k = self.negatives_per_positive
 
-def load_benchmark_conversations(
-    benchmark_path: Union[str, Path],
-    domain: str,
-    formatter: ContextAwareQueryFormatter,
-) -> List[ConversationalTurnSample]:
-    benchmark_path = Path(benchmark_path)
-    if not benchmark_path.exists():
-        raise FileNotFoundError(f"Benchmark non trovato: {benchmark_path}")
+        # -------------------------------------------------------------
+        # BM25 hard negatives
+        # -------------------------------------------------------------
+        if self.sampling_strategy == "bm25_hard":
+            selected = hard_ids[:k]
 
-    with open(benchmark_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-        raw_data = json.loads(content) if content.startswith("[") else [json.loads(l) for l in content.splitlines() if l.strip()]
+            if len(selected) < k:
+                selected.extend(
+                    self._random_negative_ids(
+                        gold_ids=gold_ids,
+                        excluded=set(selected),
+                        n=k - len(selected),
+                        idx=idx,
+                    )
+                )
 
-    samples: List[ConversationalTurnSample] = []
-    for conv in raw_data:
-        conv_id = conv.get("id")
-        for turn in conv.get("turns", []):
-            turn_id = turn.get("turn_id")
-            topic_id = f"{conv_id}_turn_{turn_id}"
-            query = turn.get("query", "")
-            history = turn.get("conversation_history", "")
-            gold_doc_ids = turn.get("gold_doc_ids", [])
-            answer = turn.get("answer", "")
+            return selected[:k]
 
-            # Costruzione con context-aware truncation deterministica
-            contextual_q = formatter.format(query=query, history=history)
+        # -------------------------------------------------------------
+        # Random negatives
+        # -------------------------------------------------------------
+        if self.sampling_strategy == "random":
+            return self._random_negative_ids(
+                gold_ids=gold_ids,
+                excluded=set(),
+                n=k,
+                idx=idx,
+            )[:k]
 
-            samples.append(
-                ConversationalTurnSample(
-                    domain=domain,
-                    conversation_id=conv_id,
-                    turn_id=turn_id,
-                    topic_id=topic_id,
-                    query=query,
-                    history=history,
-                    contextual_query=contextual_q,
-                    gold_doc_ids=gold_doc_ids,
-                    answer=answer,
+        # -------------------------------------------------------------
+        # Mixed:
+        # metà hard, metà random.
+        # -------------------------------------------------------------
+        hard_target = (k + 1) // 2
+
+        selected = hard_ids[:hard_target]
+
+        random_needed = k - len(selected)
+
+        if random_needed > 0:
+            selected.extend(
+                self._random_negative_ids(
+                    gold_ids=gold_ids,
+                    excluded=set(selected),
+                    n=random_needed,
+                    idx=idx,
                 )
             )
-    return samples
+
+        # Nel raro caso in cui i random non siano sufficienti,
+        # proviamo a utilizzare ulteriori hard negatives.
+        if len(selected) < k:
+            for doc_id in hard_ids:
+                if doc_id not in selected:
+                    selected.append(doc_id)
+
+                if len(selected) >= k:
+                    break
+
+        return selected[:k]
+
+    # -------------------------------------------------------------------------
+    # Main item
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.valid_samples[idx]
+        gold_ids = sample.gold_doc_ids
+
+        # Rotazione del positive tra le epoche.
+        positive_index = (
+            self.epoch + idx
+        ) % len(gold_ids)
+
+        positive_id = gold_ids[positive_index]
+        positive_text = self.corpus[positive_id]
+
+        negative_ids = self._select_negatives(
+            sample=sample,
+            idx=idx,
+        )
+
+        if not negative_ids:
+            raise RuntimeError(
+                f"Nessun negative disponibile per topic "
+                f"{sample.topic_id}."
+            )
+
+        negative_texts = [
+            self.corpus[doc_id]
+            for doc_id in negative_ids
+        ]
+
+        return {
+            "topic_id": sample.topic_id,
+            "domain": sample.domain,
+
+            "query": sample.contextual_query,
+
+            "positive": positive_text,
+            "positive_id": positive_id,
+
+            "negatives": negative_texts,
+            "negative_ids": negative_ids,
+        }
 
 
-def load_track2_domain_data(
-    data_dir: Union[str, Path],
-    domain: str,
-    split: str = "train",
-    formatter: Optional[ContextAwareQueryFormatter] = None,
-) -> Tuple[Dict[str, str], List[ConversationalTurnSample], Dict[str, Dict[str, int]]]:
-    p = Path(data_dir)
-    candidates = [
-        p / domain,
-        p / "track2_recor" / domain,
-        Path("..") / p / domain,
-        Path("..") / p / "track2_recor" / domain,
-    ]
-    domain_dir = next((c.resolve() for c in candidates if c.exists() and (c / "documents.jsonl").exists()), None)
-    if domain_dir is None:
-        raise FileNotFoundError(f"Cartella dominio '{domain}' non trovata in {data_dir}")
+# =============================================================================
+# Collate
+# =============================================================================
 
-    corpus = load_corpus(domain_dir / "documents.jsonl")
+class ConversationalCollateFn:
+    """
+    Tokenizza query, positive e negativi.
 
-    bench_candidates = [
-        domain_dir / f"benchmark_{split}.json",
-        domain_dir / f"benchmark_{split}.jsonl",
-        domain_dir / "benchmark.jsonl",
-        domain_dir / "benchmark.json",
-    ]
-    bench_file = next((b for b in bench_candidates if b.exists()), None)
-    if not bench_file:
-        raise FileNotFoundError(f"File benchmark non trovato per '{split}' in {domain_dir}")
+    Tutti gli esempi del batch vengono portati allo stesso numero di
+    negatives K, usando il minimo K disponibile nel batch.
+    """
 
-    if formatter is None:
-        # Fallback basico
-        class DummyFormatter:
-            def format(self, query, history):
-                return f"Current Question: {query}\n\nConversation History:\n{history}"
-        formatter = DummyFormatter()
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        max_query_len: int = 512,
+        max_doc_len: int = 512,
+    ):
+        self.tokenizer = tokenizer
+        self.max_query_len = int(max_query_len)
+        self.max_doc_len = int(max_doc_len)
 
-    samples = load_benchmark_conversations(bench_file, domain=domain, formatter=formatter)
+    def __call__(
+        self,
+        batch: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
 
-    qrels_candidates = [domain_dir / f"qrels_{split}.txt", domain_dir / "qrels.txt"]
-    qrels_file = next((q for q in qrels_candidates if q.exists()), None)
-    qrels = load_qrels(qrels_file) if qrels_file else {}
+        if not batch:
+            raise ValueError("Collate ricevuto un batch vuoto.")
 
-    return corpus, samples, qrels
+        batch_size = len(batch)
 
+        queries = [
+            item["query"]
+            for item in batch
+        ]
 
-def split_conversations_train_val(
-    samples: List[ConversationalTurnSample],
-    val_ratio: float = 0.15,
-    seed: int = 42,
-) -> Tuple[List[ConversationalTurnSample], List[ConversationalTurnSample]]:
-    """Splitta per intera conversazione garantendo zero leakage fra i turni."""
-    conv_ids = sorted(list(set(s.conversation_id for s in samples)))
-    rng = random.Random(seed)
-    rng.shuffle(conv_ids)
-    n_val = max(1, int(len(conv_ids) * val_ratio))
-    val_convs = set(conv_ids[:n_val])
-    return [s for s in samples if s.conversation_id not in val_convs], [s for s in samples if s.conversation_id in val_convs]
+        positives = [
+            item["positive"]
+            for item in batch
+        ]
+
+        k_negs = min(
+            len(item["negatives"])
+            for item in batch
+        )
+
+        if k_negs <= 0:
+            raise ValueError(
+                "Almeno un esempio del batch non possiede negativi."
+            )
+
+        # ------------------------------------------------------------------
+        # Flatten dei negativi
+        # ------------------------------------------------------------------
+
+        flat_negatives = []
+
+        for item in batch:
+            flat_negatives.extend(
+                item["negatives"][:k_negs]
+            )
+
+        # ------------------------------------------------------------------
+        # Query
+        # ------------------------------------------------------------------
+
+        query_tokens = self.tokenizer(
+            queries,
+            padding=True,
+            truncation=True,
+            max_length=self.max_query_len,
+            return_tensors="pt",
+        )
+
+        # ------------------------------------------------------------------
+        # DOCUMENTI
+        #
+        # Positivi + negativi vengono tokenizzati INSIEME.
+        # In questo modo hanno necessariamente la stessa sequence length
+        # e possono essere concatenati nel forward del bi-encoder.
+        # ------------------------------------------------------------------
+
+        all_documents = positives + flat_negatives
+
+        all_document_tokens = self.tokenizer(
+            all_documents,
+            padding=True,
+            truncation=True,
+            max_length=self.max_doc_len,
+            return_tensors="pt",
+        )
+
+        # Prima parte = positivi
+        positive_tokens = {
+            key: value[:batch_size]
+            for key, value in all_document_tokens.items()
+        }
+
+        # Seconda parte = negativi
+        negative_tokens = {
+            key: value[batch_size:]
+            for key, value in all_document_tokens.items()
+        }
+
+        return {
+            "query_inputs": query_tokens,
+            "pos_inputs": positive_tokens,
+            "neg_inputs": negative_tokens,
+
+            "batch_size": batch_size,
+            "k_negs": k_negs,
+
+            "topic_ids": [
+                item["topic_id"]
+                for item in batch
+            ],
+
+            "domains": [
+                item["domain"]
+                for item in batch
+            ],
+
+            "positive_ids": [
+                item["positive_id"]
+                for item in batch
+            ],
+
+            "negative_ids": [
+                item["negative_ids"][:k_negs]
+                for item in batch
+            ],
+        }
+
+# =============================================================================
+# Domain-balanced batch sampler
+# =============================================================================
+
+class DomainBalancedBatchSampler(Sampler[List[int]]):
+    """
+    Batch sampler domain-balanced.
+
+    Ogni batch appartiene ad un singolo dominio.
+
+    I domini vengono alternati in modo deterministico:
+
+        biology batch
+        drones batch
+        earth_science batch
+        ...
+
+    Quando un dominio esaurisce i propri esempi, viene reshuffled e
+    ricampionato. Questo consente di mantenere lo stesso numero di
+    batch per dominio senza costruire batch artificialmente misti.
+
+    Questo comportamento è intenzionale: rende gli in-batch negatives
+    più semanticamente difficili rispetto a batch composti da domini
+    differenti.
+
+    `set_epoch()` deve essere chiamato dal training loop all'inizio di
+    ogni epoca per ottenere un nuovo ordinamento deterministico.
+    """
+
+    def __init__(
+        self,
+        samples: List[ConversationalTurnSample],
+        batch_size: int,
+        seed: int = 42,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size deve essere > 0.")
+
+        if not samples:
+            raise ValueError("Nessun sample fornito al sampler.")
+
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        self.domain_to_indices: Dict[str, List[int]] = (
+            collections.defaultdict(list)
+        )
+
+        for idx, sample in enumerate(samples):
+            self.domain_to_indices[sample.domain].append(idx)
+
+        self.domains = sorted(
+            self.domain_to_indices.keys()
+        )
+
+        if not self.domains:
+            raise ValueError(
+                "Nessun dominio valido trovato nei sample."
+            )
+
+        # Manteniamo esattamente lo stesso numero di batch che avrebbe
+        # un DataLoader standard con drop_last=True.
+        self.num_batches = len(samples) // self.batch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterable[List[int]]:
+        rng = random.Random(
+            self.seed + self.epoch * 1_000_003
+        )
+
+        # Una pool separata per ogni dominio.
+        pools = {
+            domain: rng.sample(
+                indices,
+                len(indices),
+            )
+            for domain, indices in self.domain_to_indices.items()
+        }
+
+        pointers = {
+            domain: 0
+            for domain in self.domains
+        }
+
+        for batch_idx in range(self.num_batches):
+            domain = self.domains[
+                batch_idx % len(self.domains)
+            ]
+
+            pool = pools[domain]
+            pointer = pointers[domain]
+
+            batch: List[int] = []
+
+            while len(batch) < self.batch_size:
+                remaining = len(pool) - pointer
+
+                if remaining <= 0:
+                    # Ricomincia un nuovo ciclo per il dominio.
+                    pool = rng.sample(
+                        self.domain_to_indices[domain],
+                        len(self.domain_to_indices[domain]),
+                    )
+
+                    pools[domain] = pool
+                    pointer = 0
+                    remaining = len(pool)
+
+                take = min(
+                    self.batch_size - len(batch),
+                    remaining,
+                )
+
+                batch.extend(
+                    pool[pointer:pointer + take]
+                )
+
+                pointer += take
+
+            pointers[domain] = pointer
+
+            yield batch
+
+    def __len__(self) -> int:
+        return self.num_batches
+    

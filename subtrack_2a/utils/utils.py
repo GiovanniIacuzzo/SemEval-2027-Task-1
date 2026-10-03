@@ -14,6 +14,10 @@ import yaml
 import json
 import logging
 from pathlib import Path
+import torch
+import matplotlib.pyplot as plt
+import datetime 
+import random
 from typing import Dict, List, Tuple, Any, Optional, Union
 
 import pytrec_eval
@@ -25,8 +29,22 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def save_json(data: Any, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
+def save_json(data, path):
+    def make_json_safe(obj):
+        if isinstance(obj, torch.Tensor):
+            obj = obj.detach().cpu()
+            return obj.item() if obj.numel() == 1 else obj.tolist()
+
+        if isinstance(obj, dict):
+            return {k: make_json_safe(v) for k, v in obj.items()}
+
+        if isinstance(obj, (list, tuple)):
+            return [make_json_safe(v) for v in obj]
+
+        return obj
+
+    data = make_json_safe(data)
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -164,46 +182,6 @@ def reciprocal_rank_fusion(
     return final_run
 
 
-# =========================================================================
-# 5. Visualizzazione Grafica Addestramento
-# =========================================================================
-
-def plot_training_history(
-    history: Dict[str, List[float]],
-    output_path: Union[str, Path],
-    title: str = "Training Progress Sub-track 2a",
-) -> None:
-    """Traccia e salva su disco l'andamento di Loss ed eventuale Validation nDCG."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    epochs = range(1, len(history.get("train_loss", [])) + 1)
-    if not epochs:
-        logger.warning("Nessun dato di loss presente nella cronologia per generare il grafico.")
-        return
-
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-
-    color = "tab:red"
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Train Loss", color=color)
-    ax1.plot(epochs, history["train_loss"], color=color, marker="o", linewidth=2, label="Train Loss")
-    ax1.tick_params(axis="y", labelcolor=color)
-    ax1.grid(True, linestyle="--", alpha=0.5)
-
-    if "val_ndcg" in history and history["val_ndcg"]:
-        ax2 = ax1.twinx()
-        color = "tab:blue"
-        ax2.set_ylabel("Validation nDCG@10", color=color)
-        ax2.plot(epochs, history["val_ndcg"], color=color, marker="s", linewidth=2, label="Val nDCG@10")
-        ax2.tick_params(axis="y", labelcolor=color)
-
-    plt.title(title)
-    fig.tight_layout()
-    plt.savefig(output_path, dpi=300)
-    plt.close()
-    logger.info(f"Grafico salvato con successo in: {output_path}")
-
 # ==============================================================================
 # 5. Configurazione del Logging Professionale
 # ==============================================================================
@@ -255,6 +233,46 @@ def set_seed(seed: int = 42) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+# =========================================================================
+# 5. Visualizzazione Grafica Addestramento
+# =========================================================================
+
+def plot_training_history(
+    history: Dict[str, List[float]],
+    output_path: Union[str, Path],
+    title: str = "Training Progress Sub-track 2a",
+) -> None:
+    """Traccia e salva su disco l'andamento di Loss ed eventuale Validation nDCG."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("RETECO_2A_Train")
+
+    epochs = range(1, len(history.get("train_loss", [])) + 1)
+    if not epochs:
+        logger.warning("Nessun dato di loss presente nella cronologia per generare il grafico.")
+        return
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+
+    color = "tab:red"
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Train Loss", color=color)
+    ax1.plot(epochs, history["train_loss"], color=color, marker="o", linewidth=2, label="Train Loss")
+    ax1.tick_params(axis="y", labelcolor=color)
+    ax1.grid(True, linestyle="--", alpha=0.5)
+
+    if "val_ndcg" in history and history["val_ndcg"]:
+        ax2 = ax1.twinx()
+        color = "tab:blue"
+        ax2.set_ylabel("Validation nDCG@10", color=color)
+        ax2.plot(epochs, history["val_ndcg"], color=color, marker="s", linewidth=2, label="Val nDCG@10")
+        ax2.tick_params(axis="y", labelcolor=color)
+
+    plt.title(title)
+    fig.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    logger.info(f"Grafico salvato con successo in: {output_path}")
 
 
 # =========================================================================

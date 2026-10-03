@@ -1,12 +1,5 @@
-general:
-  seed: 42
-  run_tag: "reteco_2a_t4_competitive"
-  device: "auto"                    # 'auto', 'cuda', 'mps', 'cpu'
-  mixed_precision: true             # AMP FP16 nativo su CUDA (disabilitato su CPU/MPS)
-  logging_level: "INFO"
-
 paths:
-  data_mode: "full"                 # 'sample' o 'full'
+  data_mode: "full"   # oppure "sample"
   full_data_dir: "data/reteco_data/track2_recor"
   sample_data_dir: "data/sample/track2_recor"
   checkpoint_dir: "checkpoints/subtrack_2a/bi_encoder"
@@ -14,58 +7,40 @@ paths:
   log_dir: "outputs/subtrack_2a/logs"
   embedding_cache_dir: "data/cache/document_embeddings"
   hard_negatives_cache_dir: "data/cache/hard_negatives"
-  dev_run_file: "outputs/subtrack_2a/dev_run.trec"
-  submission_file: "outputs/subtrack_2a/submission_2a.trec"
 
 domains:
-  # "all" per tutti gli 11 domini o lista esplicita (es. ["drones", "biology"])
-  active_domains: ["drones"]
-  domain_balanced_training: true    # Uniforma il peso dei domini durante il training
+  active_domains:
+    - drones
+  domain_balanced_training: true
 
 data:
-  query_strategy: "budget_context"  # 'budget_context' (riserva token), 'query_only', 'concat'
-  max_query_length: 256             # Budget totale query (T4 friendly)
-  max_doc_length: 256               # Budget documenti
-  num_workers: 2
-  pin_memory: true
-  use_triplets: true
-  negatives_per_positive: 1         # Default competitivo: 4 hard negatives per positivo
-  negative_sampling_strategy: "bm25_hard" # 'bm25_hard', 'mixed', 'random'
-  val_ratio: 0.15                   # Split interno basato su conversazioni intere
+  query_strategy: "history"
+  max_query_length: 256
+  max_doc_length: 256
+  num_workers: 0
+  pin_memory: false
+
+  negatives_per_positive: 2
+  hard_negative_pool_size: 20
+  negative_sampling_strategy: "bm25_hard"
+
+  val_ratio: 0.15
 
 bi_encoder:
   model_name_or_path: "BAAI/bge-base-en-v1.5"
-  max_seq_length: 256
-  pooling_strategy: "mean"          # 'mean' oppure 'cls'
+
+  pooling_strategy: "cls"
   normalize_embeddings: true
   temperature: 0.05
+
+  gradient_checkpointing: false
+
   query_instruction:
-    enabled: true                   # Istruzione ufficiale BGE
+    enabled: true
     text: "Represent this sentence for searching relevant passages: "
-
-cross_encoder:
-  enabled: false
-  trainable: false                  # Se true, esegue il training del cross-encoder
-  model_name_or_path: "BAAI/bge-reranker-base"
-  checkpoint_dir: "checkpoints/subtrack_2a/cross_encoder"
-  max_seq_length: 384               # Finestra di contesto estesa per T4
-  batch_size: 16                    # Batch inference/train per il reranker
-  use_lora: true
-
-sparse:
-  enabled: true
-  k1: 0.9
-  b: 0.4
-  top_k_candidates: 100             # Esteso a 100 candidati
-
-hybrid_fusion:
-  enabled: true
-  rrf_k: 60                         # Ablabile su [10, 30, 60, 100]
-  top_candidates_to_rerank: 100     # Passa 100 candidati al cross-encoder
 
 lora:
   enabled: true
-  use_qlora_4bit: false             # false per BGE 110M su T4; true per LLM 7B/8B
   r: 16
   lora_alpha: 32
   lora_dropout: 0.05
@@ -73,20 +48,24 @@ lora:
   bias: "none"
 
 training:
-  epochs: 3
-  batch_size: 4                     # Ideale per sequenze a 256 token su T4 16GB
-  learning_rate: 1.0e-4             # LR per LoRA
+  epochs: 1
+  batch_size: 4
+  gradient_accumulation_steps: 1
+
+  learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.1
-  gradient_accumulation_steps: 2    # Batch size effettivo = 16
+
   max_grad_norm: 1.0
-  monitor_metric: "val_ndcg@10"     # Metrica di selezione: 'val_ndcg@10' o 'val_loss'
-  early_stopping_patience: 2
+
+  negative_chunk_size: 8
+
+  monitor_metric: "val_ndcg@10"
+  early_stopping_patience: 1
+
   log_every_n_steps: 10
 
 evaluation:
-  split: "dev"                      # Usato solo per misura finale held-out
-  eval_batch_size: 128
+  eval_batch_size: 16
+  retrieval_depth: 1000
   cutoff_k: 10
-  official_metric: "ndcg_cut_10"
-  save_json_results: true
