@@ -2,8 +2,6 @@
 
 Repository modulare, riproducibile e ottimizzata per la partecipazione ufficiale a **SemEval-2027 Task 1: RETECO** (*Reasoning-Oriented Retrieval with Temporal & Conversational Context*), focalizzata su **Track 2** (Sub-track **2a: Conversational Retrieval** e Sub-track **2b: Grounded Generation with Gold Passages**).
 
-L'architettura è progettata per consentire prototipazione e test rapidi in locale su **macOS (MacBook Air Apple Silicon / MPS)** e scalabilità su cloud per l'addestramento multi-dominio tramite **Lightning AI Studio (NVIDIA T4 GPU con FP16 nativo)**.
-
 ---
 
 ## 1. Panoramica del Task: SemEval-2027 Task 1 (RETECO)
@@ -161,116 +159,7 @@ python starter_kit/format_checker.py outputs/subtrack_2a/submission_2a.trec
 
 ---
 
-## 6. Struttura del Repository
-
-L'alberatura del progetto separa nettamente logiche di training neurale, inferenza offline e confezionamento per la leaderboard:
-
-```bash
-SemEval-2027-Task-1/
-├── environment.yaml                # Ambiente Conda unificato (PyTorch, transformers, pytrec_eval)
-├── prepare.sh                      # Script di inizializzazione, cartelle e diagnostica runtime
-├── download_data.py                # Downloader selettivo granulare (per task e domini)
-├── split_manifest.json             # Manifest di corrispondenza degli split ufficiali
-│
-├── data/
-│   ├── sample/track2_recor/        # Sample curato da 64 KB (per Mac Air)
-│   └── reteco_data/track2_recor/   # Dataset integrale degli 11 domini RECOR
-│
-├── subtrack_2a/
-│   ├── config/
-│   │   ├── config.yaml             # Configurazione di addestramento su GPU T4 (completa)
-│   │   └── test_config.yaml        # Configurazione snella per smoke test rapido su Mac
-│   │
-│   ├── dataset/
-│   │   └── dataset.py              # Parsing JSON/TREC, strategie query e PyTorch Triplet Dataset
-│   │
-│   ├── models/
-│   │   └── model.py                # Bi-Encoder (BGE-v1.5) e Cross-Encoder (Reranker) con safetensors
-│   │
-│   ├── utils/
-│   │   └── utils.py                # pytrec_eval nDCG@10, validatore TREC, Reciprocal Rank Fusion
-│   │
-│   ├── train.py                    # Pipeline di addestramento (train_one_epoch, Cosine Scheduler, AMP)
-│   ├── inference.py                # Valutazione offline diagnostica (nDCG@10 per dominio, no upload)
-│   ├── generate_submission.py      # Generatore e validatore del file di gara ufficiale per CodaLab
-│   ├── upload_to_hf.py             # Esportazione automatica e Model Card verso Hugging Face Hub
-│   └── analyse_data.py             # EDA, statistiche di lunghezza e generazione grafici
-│
-├── checkpoints/subtrack_2a/        # Pesi salvati (best_hf_model in formato safetensors compatto)
-├── outputs/subtrack_2a/            # Log di esecuzione, grafici di convergenza e file TREC
-└── starter_kit/                    # Tool ufficiali degli organizzatori (format_checker.py)
-```
-
----
-
-## 7. Guida Rapida all'Esecuzione
-
-### Step 1: Configurazione dell'Ambiente
-
-```bash
-# Inizializza l'ambiente ed esegui i controlli diagnostici hardware
-chmod +x prepare.sh
-./prepare.sh
-
-# Attiva l'ambiente virtuale
-conda activate reteco
-
-```
-
-### Step 2: Download Mirato dei Dati
-
-```bash
-# Modalità 1: Scarica il sample compatto da 64 KB (sviluppo iniziale su Mac)
-python download_data.py --task sample
-
-# Modalità 2: Scarica un singolo dominio reale per testare il codice (es. drones)
-python download_data.py --task 2a --domains drones
-
-# Modalità 3: Scarica tutti gli 11 domini di Track 2 (su Lightning AI Studio)
-python download_data.py --task 2a
-
-```
-
-### Step 3: Addestramento del Bi-Encoder
-
-```bash
-python subtrack_2a/train.py --config subtrack_2a/config/config.yaml
-```
-
-### Step 4: Valutazione Offline delle Prestazioni (Diagnostica Interna)
-
-Misura l'efficacia del modello calcolando l'**$nDCG@10$ ufficiale** sui giudizi di rilevanza noti di `dev`:
-
-```bash
-python subtrack_2a/inference.py --config subtrack_2a/config/config.yaml --split dev
-
-```
-
-### Step 5: Generazione e Validazione della Sottomissione per la Leaderboard
-
-Genera il file `.trec` a 6 colonne pronto per il caricamento su CodaLab/CodaBench:
-
-```bash
-# Genera il file di sottomissione
-python subtrack_2a/generate_submission.py --config subtrack_2a/config/config.yaml --split dev --tag IL_TUO_TEAM_RUN1
-
-# Verifica di conformità ufficiale con il format checker degli organizzatori
-python ../starter_kit/format_checker.py outputs/subtrack_2a/submission_2a.trec
-
-```
-
-### Step 6: Esportazione del Checkpoint su Hugging Face Hub
-
-Al termine del training nel cloud, trasferisci il modello privato per renderlo utilizzabile su qualsiasi macchina locale:
-
-```bash
-python upload_to_hf.py --repo_name reteco-2a-bge-base --private
-
-```
-
----
-
-## 8. Baseline di Riferimento Ufficiali
+## 6. Baseline di Riferimento Ufficiali
 
 Risultati ufficiali $nDCG@10$ (macro-average) pubblicati dagli organizzatori con modello BM25 standard ($k_1=0.9, b=0.4$):
 
@@ -283,7 +172,7 @@ L'inclusione della cronologia conversazionale incrementa il punteggio di oltre *
 
 ---
 
-## 9. Citazioni Ufficiali
+## 7. Citazioni Ufficiali
 
 Se utilizzi questo codice o i benchmark di riferimento, cita i lavori ufficiali di TEMPO e RECOR:
 
