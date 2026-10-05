@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
 subtrack_2a/inference.py
-
-Pipeline di Inferenza, Diagnostica e Ablation per SemEval-2027 Sub-track 2a.
-Caratteristiche:
-  - Risolto bug di inizializzazione logger (compatibilità con setup_logger).
-  - Cache persistente su disco per Document Embeddings con hash di consistenza.
-  - Diagnostica retrieval esaustiva a 4 stadi (Dense, BM25, RRF, Cross-Encoder).
-  - Candidati espansi (Top 100) e RRF configurabile (k=10, 30, 60, 100).
-  - Supporto accelerazione hardware (MPS per Mac, CUDA FP16 per GPU T4).
-  - Supporto per Reranker pretrained e fine-tuned.
-  - Ablation automatiche da riga di comando (A..G).
 """
 
 import os
@@ -115,8 +105,148 @@ class DocumentEmbeddingCache:
         except Exception as e:
             logger.warning(f"Salvataggio cache fallito per {domain}: {e}")
 
+
 # ==============================================================================
-# 2. Calcolo Metriche Diagnostiche
+# 2. Cache dei risultati di retrieval (Dense + BM25)
+# ==============================================================================
+class RetrievalRunCache:
+    """Cache persistente dei ranking Dense/BM25 per rendere le fusioni RRF quasi immediate."""
+
+    VERSION = "retrieval_cache_v1"
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        model_tag: str,
+        ckpt_hash: str,
+        pooling: str,
+        max_query_length: int,
+        max_doc_length: int,
+        query_strategy: str,
+        query_instruction: str,
+        sparse_enabled: bool,
+        bm25_k1: float,
+        bm25_b: float,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Tutti questi parametri entrano nella chiave per evitare di riusare
+        # accidentalmente ranking generati con una configurazione diversa.
+        self.model_tag = model_tag
+        self.ckpt_hash = ckpt_hash
+        self.pooling = pooling
+        self.max_query_length = int(max_query_length)
+        self.max_doc_length = int(max_doc_length)
+        self.query_strategy = str(query_strategy)
+        self.query_instruction = str(query_instruction)
+        self.sparse_enabled = bool(sparse_enabled)
+        self.bm25_k1 = float(bm25_k1)
+        self.bm25_b = float(bm25_b)
+
+    def _get_hash_key(
+        self,
+        domain: str,
+        split: str,
+        top_candidates: int,
+        ablation_mode: Optional[str],
+    ) -> str:
+        payload = {
+            "version": self.VERSION,
+            "model_tag": self.model_tag,
+            "ckpt_hash": self.ckpt_hash,
+            "pooling": self.pooling,
+            "max_query_length": self.max_query_length,
+            "max_doc_length": self.max_doc_length,
+            "query_strategy": self.query_strategy,
+            "query_instruction": self.query_instruction,
+            "sparse_enabled": self.sparse_enabled,
+            "bm25_k1": self.bm25_k1,
+            "bm25_b": self.bm25_b,
+            "domain": domain,
+            "split": split,
+            "top_candidates": int(top_candidates),
+            "ablation_mode": ablation_mode or "main",
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _path(
+        self,
+        domain: str,
+        split: str,
+        top_candidates: int,
+        ablation_mode: Optional[str],
+    ) -> Path:
+        key = self._get_hash_key(domain, split, top_candidates, ablation_mode)
+        return self.cache_dir / f"retrieval_{domain}_{split}_{key}.json"
+
+    def load(
+        self,
+        domain: str,
+        split: str,
+        top_candidates: int,
+        ablation_mode: Optional[str],
+    ) -> Optional[Tuple[Dict[str, List[Tuple[str, float]]], Dict[str, List[Tuple[str, float]]]]]:
+        path = self._path(domain, split, top_candidates, ablation_mode)
+        if not path.exists():
+            return None
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            dense_run = {
+                str(qid): [(str(doc_id), float(score)) for doc_id, score in docs]
+                for qid, docs in payload.get("dense_run", {}).items()
+            }
+            bm25_run = {
+                str(qid): [(str(doc_id), float(score)) for doc_id, score in docs]
+                for qid, docs in payload.get("bm25_run", {}).items()
+            }
+
+            logger.info(
+                f"✓ Retrieval cache trovata per [{domain}] "
+                f"(Dense + BM25, {len(dense_run)} query)."
+            )
+            return dense_run, bm25_run
+        except Exception as e:
+            logger.warning(f"Cache retrieval non leggibile per {domain}: {e}")
+            return None
+
+    def save(
+        self,
+        domain: str,
+        split: str,
+        top_candidates: int,
+        ablation_mode: Optional[str],
+        dense_run: Dict[str, List[Tuple[str, float]]],
+        bm25_run: Dict[str, List[Tuple[str, float]]],
+        corpus_size: int,
+        query_count: int,
+    ) -> None:
+        path = self._path(domain, split, top_candidates, ablation_mode)
+
+        payload = {
+            "version": self.VERSION,
+            "domain": domain,
+            "split": split,
+            "corpus_size": int(corpus_size),
+            "query_count": int(query_count),
+            "dense_run": dense_run,
+            "bm25_run": bm25_run,
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.info(f"✓ Retrieval cache salvata per [{domain}].")
+        except Exception as e:
+            logger.warning(f"Salvataggio retrieval cache fallito per {domain}: {e}")
+
+
+# ==============================================================================
+# 3. Calcolo Metriche Diagnostiche
 # ==============================================================================
 
 def compute_detailed_metrics(
@@ -158,10 +288,15 @@ def compute_detailed_metrics(
 
 
 # ==============================================================================
-# 3. Pipeline Principale di Inferenza
+# 4. Pipeline Principale di Inferenza
 # ==============================================================================
 
-def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Optional[str] = None):
+def run_evaluation(
+    config: Dict[str, Any],
+    split: str = "dev",
+    ablation_mode: Optional[str] = None,
+    use_retrieval_cache: bool = True,
+):
     gen_cfg = config.get("general", {})
     paths_cfg = config.get("paths", {})
     dom_cfg = config.get("domains", {})
@@ -395,7 +530,8 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
         hybrid_cfg.get("top_candidates_to_rerank", 100)
     )
 
-    rrf_k_config = int(hybrid_cfg.get("rrf_k", 60))
+    # Default prudenziale: k=10, che sul dev ufficiale ha dato il miglior macro nDCG@10.
+    rrf_k_config = int(hybrid_cfg.get("rrf_k", 10))
 
     rrf_sweep_values = [10, 30, 60, 100]
 
@@ -405,6 +541,27 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
     logger.info(
         f"RRF configurato: k={rrf_k_config} | "
         f"Sweep: {sorted(rrf_sweep_values)}"
+    )
+
+    # Cache dei ranking Dense/BM25: la fusion RRF resta sempre ricalcolabile
+    # senza ripetere encoding del corpus o indicizzazione/search BM25.
+    retrieval_cache = RetrievalRunCache(
+        cache_dir=Path(
+            paths_cfg.get(
+                "retrieval_cache_dir",
+                "data/cache/retrieval_runs",
+            )
+        ),
+        model_tag=model_name.replace("/", "_"),
+        ckpt_hash=emb_cache.ckpt_hash,
+        pooling=bi_cfg.get("pooling_strategy", "mean"),
+        max_query_length=data_cfg.get("max_query_length", 256),
+        max_doc_length=data_cfg.get("max_doc_length", 256),
+        query_strategy=query_strategy,
+        query_instruction=q_inst,
+        sparse_enabled=sparse_cfg.get("enabled", True),
+        bm25_k1=sparse_cfg.get("k1", 0.9),
+        bm25_b=sparse_cfg.get("b", 0.4),
     )
 
     all_reports: Dict[str, Any] = {
@@ -431,56 +588,110 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
         doc_ids = list(corpus.keys())
         doc_texts = [corpus[did] for did in doc_ids]
 
-        # 1. Retrieval Denso (con Cache su disco)
-        cached_data = emb_cache.load(domain, len(doc_ids))
-        if cached_data is not None:
-            corpus_embs, cached_doc_ids = cached_data
-            doc_ids = cached_doc_ids
+        # 1-2. Retrieval Dense + BM25
+        # Prima controlliamo la cache dei ranking completi. Se presente,
+        # tutte le fusioni RRF diventano praticamente istantanee.
+        cached_retrieval = None
+        if use_retrieval_cache:
+            cached_retrieval = retrieval_cache.load(
+                domain=domain,
+                split=split,
+                top_candidates=top_candidates,
+                ablation_mode=ablation_mode,
+            )
+
+        if cached_retrieval is not None:
+            dense_run, bm25_run = cached_retrieval
+
         else:
-            logger.info(f"Codifica densa corpus [{domain}] ({len(doc_texts)} passaggi)...")
-            all_embs = []
+            # -------------------------
+            # 1. Retrieval Denso
+            # -------------------------
+            cached_data = emb_cache.load(domain, len(doc_ids))
+
+            if cached_data is not None:
+                corpus_embs, cached_doc_ids = cached_data
+                doc_ids = cached_doc_ids
+            else:
+                logger.info(f"Codifica densa corpus [{domain}] ({len(doc_texts)} passaggi)...")
+                all_embs = []
+                eval_bs = int(eval_cfg.get("eval_batch_size", 64))
+                with torch.no_grad():
+                    for i in range(0, len(doc_texts), eval_bs):
+                        batch = doc_texts[i : i + eval_bs]
+                        tok = tokenizer(
+                            batch,
+                            padding=True,
+                            truncation=True,
+                            max_length=data_cfg.get("max_doc_length", 256),
+                            return_tensors="pt",
+                        ).to(device)
+                        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                            embs = bi_encoder.encode(tok["input_ids"], tok["attention_mask"])
+                        all_embs.append(embs.cpu())
+                corpus_embs = torch.cat(all_embs, dim=0)
+                emb_cache.save(domain, corpus_embs, doc_ids)
+
+            queries = [s.contextual_query for s in samples]
+            all_q_embs = []
             eval_bs = int(eval_cfg.get("eval_batch_size", 64))
             with torch.no_grad():
-                for i in range(0, len(doc_texts), eval_bs):
-                    batch = doc_texts[i : i + eval_bs]
-                    tok = tokenizer(batch, padding=True, truncation=True, max_length=data_cfg.get("max_doc_length", 256), return_tensors="pt").to(device)
+                for i in range(0, len(queries), eval_bs):
+                    batch = queries[i : i + eval_bs]
+                    tok = tokenizer(
+                        batch,
+                        padding=True,
+                        truncation=True,
+                        max_length=data_cfg.get("max_query_length", 256),
+                        return_tensors="pt",
+                    ).to(device)
                     with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                         embs = bi_encoder.encode(tok["input_ids"], tok["attention_mask"])
-                    all_embs.append(embs.cpu())
-            corpus_embs = torch.cat(all_embs, dim=0)
-            emb_cache.save(domain, corpus_embs, doc_ids)
+                    all_q_embs.append(embs.cpu())
+            query_embs = torch.cat(all_q_embs, dim=0)
 
-        queries = [s.contextual_query for s in samples]
-        all_q_embs = []
-        eval_bs = int(eval_cfg.get("eval_batch_size", 64))
-        with torch.no_grad():
-            for i in range(0, len(queries), eval_bs):
-                batch = queries[i : i + eval_bs]
-                tok = tokenizer(batch, padding=True, truncation=True, max_length=data_cfg.get("max_query_length", 256), return_tensors="pt").to(device)
-                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                    embs = bi_encoder.encode(tok["input_ids"], tok["attention_mask"])
-                all_q_embs.append(embs.cpu())
-        query_embs = torch.cat(all_q_embs, dim=0)
+            scores_mat = torch.matmul(query_embs, corpus_embs.T).numpy()
+            dense_run = {}
+            for q_idx, sample in enumerate(samples):
+                top_idx = np.argsort(-scores_mat[q_idx])[:top_candidates]
+                dense_run[sample.topic_id] = [
+                    (doc_ids[idx], float(scores_mat[q_idx][idx]))
+                    for idx in top_idx
+                ]
 
-        scores_mat = torch.matmul(query_embs, corpus_embs.T).numpy()
-        dense_run: Dict[str, List[Tuple[str, float]]] = {}
-        for q_idx, sample in enumerate(samples):
-            top_idx = np.argsort(-scores_mat[q_idx])[:top_candidates]
-            dense_run[sample.topic_id] = [(doc_ids[idx], float(scores_mat[q_idx][idx])) for idx in top_idx]
+            # -------------------------
+            # 2. Retrieval BM25
+            # -------------------------
+            bm25_run = {}
+            if sparse_cfg.get("enabled", True):
+                bm25 = OfficialBM25(
+                    corpus,
+                    k1=sparse_cfg.get("k1", 0.9),
+                    b=sparse_cfg.get("b", 0.4),
+                )
+                for sample in samples:
+                    if ablation_mode == "A":
+                        # Ablation A: Solo turno corrente
+                        raw_bm25_query = sample.query.strip()
+                    else:
+                        # History completa pulita + Domanda
+                        raw_bm25_query = f"{sample.history} {sample.query}".strip()
 
-        bm25_run = {}
-        if sparse_cfg.get("enabled", True):
-            bm25 = OfficialBM25(corpus, k1=sparse_cfg.get("k1", 0.9), b=sparse_cfg.get("b", 0.4))
-            for sample in samples:
-                if ablation_mode == "A":
-                    # Ablation A: Solo turno corrente
-                    raw_bm25_query = sample.query.strip()
-                else:
-                    # History completa pulita + Domanda
-                    raw_bm25_query = f"{sample.history} {sample.query}".strip()
-                bm25_run[sample.topic_id] = bm25.search_one(
-                    query=raw_bm25_query,
-                    top_k=top_candidates
+                    bm25_run[sample.topic_id] = bm25.search_one(
+                        query=raw_bm25_query,
+                        top_k=top_candidates,
+                    )
+
+            if use_retrieval_cache:
+                retrieval_cache.save(
+                    domain=domain,
+                    split=split,
+                    top_candidates=top_candidates,
+                    ablation_mode=ablation_mode,
+                    dense_run=dense_run,
+                    bm25_run=bm25_run,
+                    corpus_size=len(doc_ids),
+                    query_count=len(samples),
                 )
 
         # 3. Reciprocal Rank Fusion sweep
@@ -713,7 +924,7 @@ def run_evaluation(config: Dict[str, Any], split: str = "dev", ablation_mode: Op
 
 
 # ==============================================================================
-# 4. Entrypoint CLI
+# 5. Entrypoint CLI
 # ==============================================================================
 
 def main():
@@ -722,6 +933,11 @@ def main():
     parser.add_argument("--split", type=str, default="dev", choices=["dev", "train"])
     parser.add_argument("--ablation", type=str, default=None, choices=["A", "B", "C", "D", "E", "F", "G"],
                         help="A=BM25-curr, B=BM25-hist, C=Dense-pre, D=Dense-tuned, E=RRF, F=RRF+pre-rerank, G=RRF+tuned-rerank")
+    parser.add_argument(
+        "--no-retrieval-cache",
+        action="store_true",
+        help="Ignora la cache Dense/BM25 e ricalcola il retrieval.",
+    )
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -742,7 +958,12 @@ def main():
     except Exception:
         pass
 
-    run_evaluation(config, split=args.split, ablation_mode=args.ablation)
+    run_evaluation(
+        config,
+        split=args.split,
+        ablation_mode=args.ablation,
+        use_retrieval_cache=not args.no_retrieval_cache,
+    )
 
 
 if __name__ == "__main__":

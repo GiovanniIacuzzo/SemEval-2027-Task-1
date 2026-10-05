@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
 """
 subtrack_2a/train.py
-
-Training pipeline diagnostica per RETECO SemEval-2027 Sub-track 2a.
-
-Obiettivi:
-    - training contrastivo del bi-encoder;
-    - hard negatives BM25 separati dal data layer;
-    - split train/validation a livello di conversazione;
-    - validazione dense per dominio sull'intero corpus del dominio;
-    - macro-average nDCG@10;
-    - diagnostica dettagliata del training;
-    - salvataggio di metriche, configurazione e stato del best checkpoint.
-
-Il dev ufficiale NON viene usato per model selection.
-Il training utilizza:
-    official train -> internal train/validation split.
-
-Il dev ufficiale viene utilizzato successivamente da inference.py
-per la valutazione held-out.
 """
 
 from __future__ import annotations
@@ -1741,141 +1723,143 @@ def train_bi_encoder(
             # Diagnostics dei logits
             # -------------------------------------------------------------
 
-        with torch.no_grad():
+            with torch.no_grad():
 
-            logits = output["logits"].detach()
+                logits = output["logits"].detach()
 
-            positive_logits = logits[:, 0]
+                positive_logits = logits[:, 0]
 
-            if logits.shape[1] > 1:
+                if logits.shape[1] > 1:
 
-                negative_logits = logits[:, 1:]
+                    negative_logits = logits[:, 1:]
 
-                max_negative = (
-                    negative_logits.max(
-                        dim=1
-                    ).values
+                    max_negative = (
+                        negative_logits.max(
+                            dim=1
+                        ).values
+                    )
+
+                    margin = (
+                        positive_logits
+                        - max_negative
+                    )
+
+                    rank1 = (
+                        logits.argmax(
+                            dim=1
+                        ) == 0
+                    ).float().mean()
+
+                else:
+
+                    max_negative = torch.zeros_like(
+                        positive_logits
+                    )
+
+                    margin = positive_logits
+
+                    rank1 = torch.ones_like(
+                        positive_logits
+                    ).mean()
+
+                # ----------------------------------------------------------
+                # Nuove diagnostiche in cosine space
+                # ----------------------------------------------------------
+
+                positive_cosine = float(
+                    output["positive_cosine"]
+                    .detach()
+                    .item()
                 )
 
-                margin = (
-                    positive_logits
-                    - max_negative
+                hard_negative_cosine = float(
+                    output["hard_negative_cosine"]
+                    .detach()
+                    .item()
                 )
 
-                rank1 = (
-                    logits.argmax(
-                        dim=1
-                    ) == 0
-                ).float().mean()
-
-            else:
-
-                max_negative = torch.zeros_like(
-                    positive_logits
+                in_batch_negative_cosine = float(
+                    output["in_batch_negative_cosine"]
+                    .detach()
+                    .item()
                 )
 
-                margin = positive_logits
-
-                rank1 = torch.ones_like(
-                    positive_logits
-                ).mean()
-
-            # --------------------------------------------------------------
-            # Nuove diagnostiche in cosine space
-            # --------------------------------------------------------------
-
-            positive_cosine = float(
-                output["positive_cosine"].detach().item()
-            )
-
-            hard_negative_cosine = float(
-                output["hard_negative_cosine"].detach().item()
-            )
-
-            in_batch_negative_cosine = float(
-                output["in_batch_negative_cosine"].detach().item()
-            )
-
-            hard_negative_margin = (
-                positive_cosine
-                - hard_negative_cosine
-            )
-
-            in_batch_margin = (
-                positive_cosine
-                - in_batch_negative_cosine
-            )
-
-            # Accumulo diagnostiche
-            running_positive_cosine += positive_cosine
-            running_hard_negative_cosine += (
-                hard_negative_cosine
-            )
-            running_in_batch_negative_cosine += (
-                in_batch_negative_cosine
-            )
-            running_hard_negative_margin += (
-                hard_negative_margin
-            )
-            running_in_batch_margin += (
-                in_batch_margin
-            )
-
-            running_pos_logit += float(
-                positive_logits.mean().item()
-            )
-
-            running_max_neg_logit += float(
-                max_negative.mean().item()
-            )
-
-            running_margin += float(
-                margin.mean().item()
-            )
-
-            running_rank1 += float(
-                rank1.item()
-            )
-
-            batch_loss = float(
-                raw_loss.item()
-            )
-
-            running_loss += batch_loss
-            running_loss_sq += (
-                batch_loss ** 2
-            )
-
-            batch_size_actual = len(
-                batch["topic_ids"]
-            )
-
-            total_examples += (
-                batch_size_actual
-            )
-
-            # -------------------------------------------------------------
-            # Domain loss
-            # -------------------------------------------------------------
-
-            if len(unique_domains) == 1:
-
-                domain = next(
-                    iter(unique_domains)
+                hard_negative_margin = (
+                    positive_cosine
+                    - hard_negative_cosine
                 )
 
-                domain_loss_sum[
-                    domain
-                ] += batch_loss
+                in_batch_margin = (
+                    positive_cosine
+                    - in_batch_negative_cosine
+                )
 
-                domain_batch_count[
-                    domain
-                ] += 1
+                # ----------------------------------------------------------
+                # Accumulo diagnostiche
+                # ----------------------------------------------------------
 
-            else:
+                running_positive_cosine += positive_cosine
 
-                # Fallback diagnostico
-                for domain in unique_domains:
+                running_hard_negative_cosine += (
+                    hard_negative_cosine
+                )
+
+                running_in_batch_negative_cosine += (
+                    in_batch_negative_cosine
+                )
+
+                running_hard_negative_margin += (
+                    hard_negative_margin
+                )
+
+                running_in_batch_margin += (
+                    in_batch_margin
+                )
+
+                running_pos_logit += float(
+                    positive_logits.mean().item()
+                )
+
+                running_max_neg_logit += float(
+                    max_negative.mean().item()
+                )
+
+                running_margin += float(
+                    margin.mean().item()
+                )
+
+                running_rank1 += float(
+                    rank1.item()
+                )
+
+                batch_loss = float(
+                    raw_loss.item()
+                )
+
+                running_loss += batch_loss
+
+                running_loss_sq += (
+                    batch_loss ** 2
+                )
+
+                batch_size_actual = len(
+                    batch["topic_ids"]
+                )
+
+                total_examples += (
+                    batch_size_actual
+                )
+
+                # ----------------------------------------------------------
+                # Domain loss
+                # ----------------------------------------------------------
+
+                if len(unique_domains) == 1:
+
+                    domain = next(
+                        iter(unique_domains)
+                    )
+
                     domain_loss_sum[
                         domain
                     ] += batch_loss
@@ -1883,6 +1867,18 @@ def train_bi_encoder(
                     domain_batch_count[
                         domain
                     ] += 1
+
+                else:
+
+                    for domain in unique_domains:
+
+                        domain_loss_sum[
+                            domain
+                        ] += batch_loss
+
+                        domain_batch_count[
+                            domain
+                        ] += 1
 
             # -------------------------------------------------------------
             # Optimizer step
@@ -1902,6 +1898,7 @@ def train_bi_encoder(
             if should_update:
 
                 if scaler is not None:
+
                     scaler.unscale_(
                         optimizer
                     )
@@ -1971,9 +1968,15 @@ def train_bi_encoder(
 
             progress.set_postfix(
                 loss=f"{batch_loss:.4f}",
-                pos=f"{running_pos_logit / (batch_idx + 1):.2f}",
-                margin=f"{running_margin / (batch_idx + 1):.2f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                pos=(
+                    f"{running_pos_logit / (batch_idx + 1):.2f}"
+                ),
+                margin=(
+                    f"{running_margin / (batch_idx + 1):.2f}"
+                ),
+                lr=(
+                    f"{optimizer.param_groups[0]['lr']:.2e}"
+                ),
                 sec=f"{step_time:.2f}",
             )
 
