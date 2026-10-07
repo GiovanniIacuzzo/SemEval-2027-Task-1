@@ -1,0 +1,99 @@
+# ==============================================================================
+# RETECO SemEval-2027 Task 1 - Sub-track 2b: Gold-Passage Grounded Generation
+# Configuration File
+# ==============================================================================
+
+general:
+  seed: 42
+  run_tag: "subtrack_2b_sft_qwen"
+  device: "auto"                    # 'auto', 'cuda', 'mps', 'cpu'
+  logging_level: "INFO"
+
+paths:
+  data_mode: "full"                 # 'full' o 'sample'
+  full_data_dir: "data/reteco_data/track2_recor"
+  sample_data_dir: "data/sample/track2_recor"
+  train_file: "benchmark_train.json"
+  dev_file: "benchmark_dev.json"
+  documents_file: "documents.jsonl"
+  checkpoint_dir: "checkpoints/subtrack_2b"
+  output_dir: "outputs/subtrack_2b"
+  log_dir: "outputs/subtrack_2b/logs"
+
+domains:
+  # "all" per addestrare/valutare su tutti gli 11 domini RECOR o lista esplicita
+  active_domains:
+    - "drones"
+  all_domains:
+    - "biology"
+    - "drones"
+    - "earth_science"
+    - "economics"
+    - "hardware"
+    - "law"
+    - "medicalsciences"
+    - "politics"
+    - "psychology"
+    - "robotics"
+    - "sustainable_living"
+
+data:
+  max_input_tokens: 3584
+  max_output_tokens: 512
+  max_history_turns: 5
+  num_workers: 2
+  pin_memory: true
+
+model:
+  name: "Qwen/Qwen2.5-0.5B-Instruct"   # Completamente configurabile (es. Qwen/Qwen2.5-3B-Instruct)
+  load_in_4bit: false               # Richiede CUDA e bitsandbytes (disabilitato su MPS/CPU)
+  gradient_checkpointing: true
+  trust_remote_code: true
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "gate_proj"
+      - "up_proj"
+      - "down_proj"
+
+training:
+  epochs: 2
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  train_batch_size: 1
+  eval_batch_size: 1
+  gradient_accumulation_steps: 8    # Batch size effettivo = 8
+  warmup_ratio: 0.05
+  fp16: true                        # Abilitato su CUDA con supporto FP16
+  bf16: false                       # Consigliato su Ampere/Hopper se disponibile
+  max_grad_norm: 1.0
+  domain_balanced_sampling: true    # Temperature sampling per bilanciare gli 11 domini
+  domain_sampling_temperature: 0.5
+  internal_val_ratio: 0.1           # 10% di conversazioni held-out (nessun leakage tra turni)
+  save_strategy: "epoch"
+  logging_steps: 10
+  early_stopping_patience: 2
+
+prompt:
+  ablation: "D"                     # A: query_only | B: query+hist | C: query+evid | D: full (hist+evid+query) | E: with_reasoning
+  use_subquestion_reasoning: false   # Se true, include il campo ausiliario nel prompt
+  include_domain: true
+  include_original_query: false
+
+generation:
+  max_new_tokens: 512
+  do_sample: false                  # Greedy decoding deterministico per default
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.05
+  strategy: "direct"                # 'direct' o 'refine' (verifica di secondo stadio)
+  num_candidates: 1                 # Se > 1, genera N risposte e seleziona la migliore
+  grounding_check: false            # Valutazione di overlap fattuale sui candidati

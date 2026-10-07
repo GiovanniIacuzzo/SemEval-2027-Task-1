@@ -1,0 +1,11 @@
+transformers>=4.48,<5
+peft>=0.20
+accelerate>=1.2
+bitsandbytes>=0.48
+PyYAML>=6.0
+numpy>=1.26
+tqdm>=4.66
+safetensors>=0.4
+rouge-score>=0.1.2
+nltk>=3.9
+bert-score>=0.3.13

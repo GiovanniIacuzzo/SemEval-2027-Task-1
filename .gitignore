@@ -7,3 +7,4 @@ outputs/
 __pycache__/
 *.log
 README_subtrack_2a.md
+*.pdf
