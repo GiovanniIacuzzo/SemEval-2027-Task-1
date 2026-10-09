@@ -2,6 +2,7 @@ idea.md
 .env
 starter_kit/
 data/
+hf_release/
 checkpoints/
 outputs/
 __pycache__/
