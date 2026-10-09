@@ -36,15 +36,15 @@ References: [official task definition](https://datascienceuibk.github.io/RETECO/
 
 ```mermaid
 flowchart TD
-    A[Current target turn] --> C[Query/context construction]
-    B[Conversation history] --> C
-    C --> D[Dense bi-encoder<br/>BGE base English v1.5]
-    C --> E[BM25 retrieval]
-    D --> F[Ranked candidate lists]
+    A["Current target turn"] --> C["Query and context construction"]
+    B["Conversation history"] --> C
+    C --> D["Dense bi-encoder: BGE base English v1.5"]
+    C --> E["BM25 retrieval"]
+    D --> F["Ranked candidate lists"]
     E --> F
-    F --> G[Reciprocal Rank Fusion]
-    G --> H[Ranked passage IDs]
-    H --> I[nDCG@10 and retrieval diagnostics]
+    F --> G["Reciprocal Rank Fusion (RRF)"]
+    G --> H["Ranked passage IDs"]
+    H --> I["nDCG@10 and retrieval diagnostics"]
 ```
 
 The implementation intentionally keeps the dense and lexical retrieval paths separate until fusion. This makes it possible to inspect each component independently and quantify whether fusion helps or hurts in each domain.
@@ -133,7 +133,88 @@ The following values were recorded in local experimental results for eight domai
 
 > **Reporting note:** do not describe the table above as the official SemEval result or compare it directly with the published dev macro-average until the local split, domain coverage and scorer are verified. The snapshot currently contains eight of the eleven RECOR domains.
 
-## 7. Reproducing experiments
+## 7. Diagnostic figures
+
+The repository includes the following exploratory plots under the root-level `img/` directory. They document dataset composition and local retrieval diagnostics; they are not additional official leaderboard results. The retrieval figures should be interpreted together with the split/domain caveats in [Section 6](#6-results).
+
+### Dataset and evidence profile
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/1_corpus_distribution.png" alt="Corpus distribution across RECOR domains" width="440">
+      <br><sub>Corpus size by domain</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/2_train_vs_dev_turns.png" alt="Train versus development turns" width="440">
+      <br><sub>Train/dev turn distribution</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/2_history_by_turn_depth.png" alt="Conversation history by turn depth" width="440">
+      <br><sub>History characteristics by turn depth</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/3_turn_depth_distribution.png" alt="Turn depth distribution across domains" width="440">
+      <br><sub>Turn-depth distribution</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/3_gold_passages_per_domain.png" alt="Gold passages per domain" width="440">
+      <br><sub>Gold evidence volume by domain</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/4_gold_passages_per_turn.png" alt="Gold passages per turn" width="440">
+      <br><sub>Number of gold passages per turn</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/4_gold_attribution_pie.png" alt="Gold attribution distribution" width="440">
+      <br><sub>Gold attribution breakdown</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/4_lexical_overlap_to_gold.png" alt="Lexical overlap to gold evidence" width="440">
+      <br><sub>Lexical overlap with gold passages</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/5_lengths_distribution.png" alt="Length distribution" width="440">
+      <br><sub>Query/context length distribution</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/1_bge_token_lengths.png" alt="BGE token lengths" width="440">
+      <br><sub>Token-length profile for BGE</sub>
+    </td>
+  </tr>
+</table>
+
+### Retrieval diagnostics
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/3_union_vs_rrf_recall.png" alt="Union versus RRF recall" width="440">
+      <br><sub>Candidate union versus RRF recall</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/5_candidate_pool_complementarity.png" alt="Candidate pool complementarity" width="440">
+      <br><sub>Complementarity of dense and lexical candidates</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/5_retrieval_by_turn_depth.png" alt="Retrieval quality by turn depth" width="440">
+      <br><sub>Retrieval behavior by conversational depth</sub>
+    </td>
+    <td></td>
+  </tr>
+</table>
+
+## 8. Reproducing experiments
 
 From the repository root, configure the domain(s), data path, model and output directory in `subtrack_2a/config/config.yaml`, then run:
 
@@ -155,7 +236,7 @@ python subtrack_2a/generate_submission.py --help
 
 Do not launch a costly full training run until the data path, active domains, validation split, negative sampling and checkpoint directory have been checked in the logs.
 
-## 8. Limitations and next steps
+## 9. Limitations and next steps
 
 - The local results table is incomplete: three domain scores and final split metadata still need to be consolidated.
 - Fusion is not uniformly better than the best individual retriever in the available snapshot.

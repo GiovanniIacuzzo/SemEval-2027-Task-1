@@ -77,6 +77,54 @@ The default keeps reasoning metadata disabled and uses the history, current quer
 
 The dataset builds a prompt using the model tokenizer/chat template when available and applies budget-aware truncation to long histories and evidence. Input and output limits are configuration values. Since some domains—especially Earth Science—contain very long evidence contexts, retention after truncation remains an important diagnostic rather than a solved problem.
 
+
+### Dataset diagnostics
+
+The plots below describe the RECOR data and evidence inputs used by the generation pipeline. They are **data diagnostics, not generation-quality scores**. In particular, lexical overlap is only a surface-level signal and does not establish semantic faithfulness.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/1_corpus_distribution.png" alt="Corpus distribution across RECOR domains" width="440">
+      <br><sub>Corpus size across domains</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/2_train_vs_dev_turns.png" alt="Train versus development turns" width="440">
+      <br><sub>Train/dev split size</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/2_history_by_turn_depth.png" alt="History by turn depth" width="440">
+      <br><sub>History context across dialogue depth</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/3_turn_depth_distribution.png" alt="Turn-depth distribution" width="440">
+      <br><sub>Number of turns by depth</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/3_gold_passages_per_domain.png" alt="Gold passages per domain" width="440">
+      <br><sub>Gold evidence by domain</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/4_gold_passages_per_turn.png" alt="Gold passages per turn" width="440">
+      <br><sub>Gold passage count distribution</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="../img/5_lengths_distribution.png" alt="Query and context length distribution" width="440">
+      <br><sub>Input length distribution</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="../img/4_lexical_overlap_to_gold.png" alt="Lexical overlap with gold passages" width="440">
+      <br><sub>Lexical overlap diagnostic</sub>
+    </td>
+  </tr>
+</table>
+
 ## 4. Model and training recipe
 
 The implementation uses a configurable instruction-tuned causal LM through Hugging Face Transformers, with PEFT/LoRA for parameter-efficient supervised fine-tuning.
