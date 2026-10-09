@@ -1,198 +1,168 @@
-# SemEval-2027 Task 1: RETECO (Track 2: Conversational Retrieval & Grounded Generation)
+<div align="center">
 
-Repository modulare, riproducibile e ottimizzata per la partecipazione ufficiale a **SemEval-2027 Task 1: RETECO** (*Reasoning-Oriented Retrieval with Temporal & Conversational Context*), focalizzata su **Track 2** (Sub-track **2a: Conversational Retrieval** e Sub-track **2b: Grounded Generation with Gold Passages**).
+# RETECO · Conversational Retrieval & Grounded Generation
 
----
+**A research implementation for SemEval-2027 Task 1 — RETECO**
 
-## 1. Panoramica del Task: SemEval-2027 Task 1 (RETECO)
+[![SemEval-2027](https://img.shields.io/badge/SemEval-2027-635BFF?style=flat-square)](https://semeval.github.io/SemEval2027/)
+[![Task](https://img.shields.io/badge/Shared%20Task-RETECO-0A7B83?style=flat-square)](https://datascienceuibk.github.io/RETECO/)
+[![Track](https://img.shields.io/badge/Focus-Track%202%20%7C%20RECOR-2368A0?style=flat-square)](https://datascienceuibk.github.io/RETECO/task.html)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-Transformers%20%2B%20PEFT-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org/)
 
-I benchmark tradizionali di Information Retrieval (es. BEIR) valutano i sistemi unicamente sulla similarità semantica superficiale tra query e documento. Nella realtà applicativa dei sistemi RAG (*Retrieval-Augmented Generation*) e degli assistenti virtuali, la rilevanza dipende da fattori contestuali complessi: **quando** un fatto è valido, **come** cambiano le circostanze nel tempo e **cosa è già stato stabilito** nei turni precedenti di una conversazione.
+*Retrieval that understands the current turn, the conversation so far, and the evidence needed to answer.*
 
-**RETECO** è la competizione condivisa accettata a SemEval-2027 per colmare questa lacuna, suddivisa in due percorsi indipendenti e complementari:
-
-* **Track 1 · Temporal Grounded Retrieval (TEMPO):** richiede di recuperare passaggi vincolati da requisiti temporali espliciti o impliciti (Sub-track 1a per query globali e 1b per step decomposti).
-* **Track 2 · Conversational Retrieval & RAG (RECOR):** richiede di tracciare l'evoluzione dello stato del dialogo, gestire coreferenze e anafore, e compiere inferenze logiche multi-step per identificare passaggi rilevanti su corpora verticali di dominio.
-
-### Team Organizzatore Ufficiale
-
-RETECO è coordinato da ricercatori della **University of Innsbruck**, della **University of British Columbia (UBC)** e della **Johns Hopkins University**:
-
-* **Abdelrahman Abdallah** (University of Innsbruck — Lead Organizer)
-* **Mohammed Ali** (University of Innsbruck — Co-organizer, First Author di RECOR)
-* **Muhammad Abdul-Mageed** (University of British Columbia)
-* **Kevin Duh** (Johns Hopkins University)
-* **Adam Jatowt** (University of Innsbruck)
+</div>
 
 ---
 
-## 2. Approfondimento Track 2: RECOR Benchmark
+## Overview
 
-Track 2 si basa sul benchmark scientifico **RECOR** (*Reasoning-focused Multi-turn Conversational Retrieval Benchmark*, Findings of ACL 2026). La traccia affronta il collasso prestazionale dei motori di ricerca convenzionali all'aumentare della profondità del dialogo ($T_1 \dots T_5+$).
+This repository contains an independent implementation for the **conversational part of RETECO (Track 2 / RECOR)**, a SemEval-2027 shared task on reasoning-oriented retrieval. Unlike a simple keyword search, conversational retrieval must interpret follow-up questions, resolve references such as *“that”* or *“what about the second one?”*, and find passages that actually support the current information need.
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        CONVERSATION FLOW (RECOR)                       │
-├────────────────────────────────────────────────────────────────────────┤
-│ Turn 1: "In FPV drone motors, why is lubrication only for bearings?"   │
-│         └── Context: No previous conversation.                         │
-│                                                                        │
-│ Turn 2: "What happens if oil gets on the stator coils?"                │
-│         └── Context: Resolves implicit reference to Turn 1 motors.     │
-│                                                                        │
-│ Turn 3: "Does high KV exacerbate that failure?"                        │
-│         └── Context: Coreference ("that failure") + Domain reasoning.  │
-└────────────────────────────────────────────────────────────────────────┘
-                                     │
-                 ┌───────────────────┴───────────────────┐
-                 ▼                                       ▼
-    ┌─────────────────────────┐             ┌─────────────────────────┐
-    │      SUB-TRACK 2a       │             │      SUB-TRACK 2b       │
-    │ Conversational Retr.    │             │ Grounded Generation     │
-    ├─────────────────────────┤             ├─────────────────────────┤
-    │ Search domain corpus    │             │ Gold passages provided  │
-    │ Output: Top-10 Passages │             │ Output: Factual Answer  │
-    │ Metric: nDCG@10         │             │ Metric: 5-Dim LLM-Judge │
-    └─────────────────────────┘             └─────────────────────────┘
+The project focuses on two complementary settings:
 
+| Sub-track | Research question | System output | Main evaluation |
+|---|---|---|---|
+| **[2a — Conversational Retrieval](subtrack_2a/README.md)** | Can we retrieve relevant evidence using both the current question and dialogue history? | Ranked passage/document IDs | nDCG@10 |
+| **[2b — Gold-Passage Generation](subtrack_2b/README.md)** | Given the gold evidence, can a model produce a useful, coherent, faithful answer? | A grounded answer per target turn | Five generation-judge dimensions |
+
+Sub-track 2b deliberately receives organizer-provided gold passages. It therefore isolates **generation quality** from retrieval quality; it is not a retrieval or end-to-end RAG experiment. See the [official task definition](https://datascienceuibk.github.io/RETECO/task.html) for the full distinction.
+
+> **Project scope:** this is a participant/research implementation, not an official RETECO organizer repository. Local experiment results are labelled separately from organizer baselines and must not be interpreted as official leaderboard results.
+
+## System at a glance
+
+```mermaid
+flowchart LR
+    A[Current turn] --> C[Conversation context]
+    B[Previous turns] --> C
+    C --> D[Sub-track 2a<br/>Dense retriever + BM25]
+    D --> E[Rank fusion<br/>RRF]
+    E --> F[Ranked evidence IDs]
+    C --> G[Sub-track 2b input]
+    H[Gold passages] --> G
+    G --> I[Instruction-tuned causal LM<br/>SFT + LoRA / QLoRA]
+    I --> J[Grounded answer]
 ```
 
-### Sub-track 2a: Conversational Retrieval
-
-* **Obiettivo:** Dato l'intero storico del dialogo pregresso (`conversation_history`) e la domanda del turno target (`query`), il sistema deve interrogare l'intero corpus del dominio di riferimento ed estrarre una graduatoria ordinata dei migliori 10 passaggi rilevanti.
-* **Sfide Tecniche:**
-1. *Risoluzione del contesto discorsivo:* gestione di ellissi, continuazioni tematiche e pronomi/anafore orfane di referente esplicito.
-2. *Ragionamento multi-step:* i passaggi gold supportano la risposta tramite implicazione logica, non attraverso il mero overlap lessicale di parole chiave.
-3. *Decadimento per profondità di turno:* capacità di mantenere stabili le metriche anche su turni avanzati ($T_3, T_4, T_5+$).
-
-
-* **Input del Sistema:** file `benchmark_train.json` o `benchmark_dev.json` (conversazioni e cronologia) + `documents.jsonl` (corpus integrale del dominio).
-* **Output Richiesto:** file in formato TREC a 6 colonne contenente esattamente i primi 10 passaggi per ciascun identificatore di turno.
-* **Metrica Ufficiale di Valutazione:** **$nDCG@10$** (Normalized Discounted Cumulative Gain al cutoff 10), calcolato mediante la libreria ufficiale `pytrec_eval` e macro-mediato su tutti i domini.
-
-### Sub-track 2b: Grounded Generation with Gold Passages
-
-* **Obiettivo:** Data la cronologia conversazionale, il turno corrente e l'insieme dei passaggi gold documentali *esplicitamente forniti a priori*, il modello generativo deve sintetizzare una risposta corretta, coerente e interamente ancorata alle evidenze fornite.
-* **Scopo Sperimentale:** Isolare la qualità della componente linguistica generativa dagli errori di richiamo del retriever, stabilendo l'upper-bound teorico della pipeline.
-* **Input del Sistema:** file `benchmark_*.json` contenente per ciascun turno il campo `gold_doc_ids`, abbinato ai testi dei passaggi estratti da `documents.jsonl`.
-* **Output Richiesto:** stringa testuale della risposta per ciascun turno conversazionale.
-* **Metrica Ufficiale di Valutazione:** Valutazione multidimensionale tramite LLM-as-a-Judge (GPT-4o) calibrato su scala Likert 1–5 normalizzata [0, 1] lungo 5 dimensioni: **Correctness**, **Completeness**, **Relevance**, **Coherence** e **Faithfulness**.
-
----
-
-## 3. Architettura dei Dati e Corpus RECOR
-
-L'intero dataset v1.1 di RETECO è ospitato su Hugging Face: [`DataScience-UIBK/RETECO-SemEval2027`](https://www.google.com/search?q=https://huggingface.co/datasets/DataScience-UIBK/RETECO-SemEval2027&utm_source=gemini).
-
-Track 2 comprende **507.141 documenti** distribuiti su **11 domini specialistici indipendenti**:
-
-* **6 Domini accademico-scientifici (derivati da BRIGHT):** Biology, Earth Science, Economics, Psychology, Robotics, Sustainable Living.
-* **5 Domini tecnici ad alta competenza (derivati da StackExchange):** Drones, Hardware, Law, Medical Sciences, Politics.
-
-| Dominio | Documenti Corpus | Conversazioni (Tr/Dv) | Turni Target (Tr/Dv) | Qrels Gold (Tr/Dv) |
-| --- | --- | --- | --- | --- |
-| `biology` | 57,359 | 59 / 26 | 247 / 115 | 368 / 196 |
-| `drones` | 16,381 | 26 / 11 | 104 / 38 | 227 / 107 |
-| `earth_science` | 121,249 | 69 / 29 | 321 / 133 | 536 / 181 |
-| `economics` | 50,220 | 52 / 22 | 196 / 92 | 497 / 159 |
-| `hardware` | 26,308 | 32 / 14 | 130 / 58 | 281 / 114 |
-| `law` | 20,027 | 35 / 15 | 164 / 66 | 441 / 145 |
-| `medicalsciences` | 23,297 | 31 / 13 | 139 / 44 | 305 / 101 |
-| `politics` | 16,712 | 30 / 13 | 159 / 54 | 385 / 142 |
-| `psychology` | 52,835 | 59 / 25 | 234 / 99 | 529 / 191 |
-| `robotics` | 61,961 | 48 / 20 | 184 / 75 | 310 / 147 |
-| `sustainable_living` | 60,792 | 55 / 23 | 235 / 84 | 419 / 182 |
-| **TOTALE TRACK 2** | **507,141** | **496 / 211** | **2,113 / 858** | **4,298 / 1,665** |
-
-### Regole Fondamentali di Splitting
-
-1. **Il corpus non è mai diviso:** in entrambi gli split (Train e Dev), il retriever esegue la ricerca sull'intero corpus del dominio (`documents.jsonl`).
-2. **Split 70/30 a livello di intera conversazione:** tutti i turni appartenenti alla medesima conversazione risiedono nello stesso split. Questo schema previene qualsiasi *data leakage* o contaminazione contestuale tra train e dev.
-3. **Gold judgments rilasciati per entrambi gli split pubblici:** i file `qrels_train.txt` e `qrels_dev.txt` sono noti e consentono di sviluppare, fittare e validare localmente il sistema.
-
----
-
-## 4. Leaderboard, Piattaforma di Gara e Valutazione Ufficiale
-
-### Dove si trova la Leaderboard e la Piattaforma di Sottomissione
-
-* **Piattaforma di Competizione:** la fase di gara ufficiale sarà ospitata su **CodaLab / CodaBench**, con link e registrazione che verranno ufficializzati sul sito istituzionale [RETECO Participate](https://www.google.com/search?q=https://datascienceuibk.github.io/RETECO/participate.html&utm_source=gemini) e sulla [Mailing List Ufficiale](https://www.google.com/search?q=https://groups.google.com/g/semeval-2027-reteco&utm_source=gemini).
-* **Finestra Temporale di Valutazione Ufficiale:** **10 – 31 Gennaio 2027**.
-* **Test Set Nascosto (Cieco):** Durante la finestra di valutazione verrà rilasciato un nuovo set di test annotato e mai reso pubblico (~200 turni target per Track 2, bilanciati sugli 11 domini) privo di giudizi di rilevanza (`qrels`).
-* **Politica di Sottomissione:** È previsto un tetto massimo di upload giornalieri per team (*daily submission cap*) per impedire il tuning sui dati di test.
-* **Classifica Ufficiale:** La leaderboard stila la graduatoria dei sistemi partecipanti basandosi unicamente sul valore macro-mediato di **$nDCG@10$**. Le prestazioni disaggregate per dominio e per profondità di turno ($T_1 \dots T_5+$) sono riportate a fini diagnostici.
-
-### Standard di Formattazione della Submission (Formato TREC a 6 Colonne)
-
-Per la Sub-track 2a, la sottomissione deve essere un singolo file di testo `.trec` con esattamente 6 colonne separate da spazi o tabulazioni:
+## Repository structure
 
 ```text
-<topic_id> Q0 <doc_id> <rank> <score> <tag>
-
+.
+├── README.md
+├── subtrack_2a/
+│   ├── README.md
+│   ├── config/config.yaml
+│   ├── dataset/dataset.py
+│   ├── models/model.py
+│   ├── utils/utils.py
+│   ├── analyse_data.py
+│   ├── generate_submission.py
+│   ├── inference.py
+│   ├── train.py
+│   └── upload_to_hf.py
+├── subtrack_2b/
+│   ├── README.md
+│   ├── config/config.yaml
+│   ├── dataset/dataset.py
+│   ├── models/model.py
+│   ├── utils/utils.py
+│   ├── analyse_data.py
+│   ├── inference.py
+│   └── train.py
+├── data/                  # downloaded locally; do not commit the full corpus
+├── checkpoints/           # generated model checkpoints; do not commit
+└── outputs/               # predictions, metrics and logs
 ```
 
-* **`topic_id`:** identificatore obbligatorio nella forma `<conversation_id>_turn_<turn_id>` (es. `ex_3025_turn_1`).
-* **`Q0`:** costante fissa dello standard TREC.
-* **`doc_id`:** identificativo univoco del documento all'interno del dominio (es. `drones_ex_3025_doc_0`).
-* **`rank`:** rango assegnato al documento, da `1` a `10`.
-* **`score`:** punteggio numerico di pertinenza (deve essere strettamente non crescente all'aumentare del rango).
-* **`tag`:** identificativo mnemonico del team o della run (es. `TEAM_RUN_1`).
+The directory tree above documents the intended layout. Generated datasets, checkpoints, model caches and run outputs should remain outside version control unless there is a specific reason to publish them.
 
-La correttezza sintattica del file viene verificata dal tool ufficiale dello starter kit prima del caricamento sulla piattaforma:
+## Task and data
+
+RETECO contains two broad tracks: **temporal retrieval** (TEMPO) and **reasoning-intensive conversational retrieval** (RECOR). This repository focuses on RECOR, which contains 11 conversational domains. The public RETECO release provides train/dev records and gold judgments; the hidden SemEval evaluation set is separate.
+
+- [Official RETECO website](https://datascienceuibk.github.io/RETECO/)
+- [Task definition and sub-tracks](https://datascienceuibk.github.io/RETECO/task.html)
+- [Evaluation protocol](https://datascienceuibk.github.io/RETECO/evaluation.html)
+- [Dataset on Hugging Face](https://huggingface.co/datasets/DataScience-UIBK/RETECO-SemEval2027)
+- [Official task/starter-kit repository](https://github.com/DataScienceUIBK/RETECO)
+- [Official BM25 baseline results](https://github.com/DataScienceUIBK/RETECO/blob/main/starter_kit/BASELINE_RESULTS.md)
+- [SemEval-2027 task list](https://github.com/SemEval/SemEval2027/blob/main/tasks.md)
+
+### Downloading the data
+
+Follow the official data instructions and place the release where the project configuration expects it. For the current configuration, the Track 2 domain files are expected beneath `data/reteco_data/track2_recor/`.
 
 ```bash
-python starter_kit/format_checker.py outputs/subtrack_2a/submission_2a.trec
-# Output atteso: RESULT: VALID
-
+pip install huggingface_hub
+hf download DataScience-UIBK/RETECO-SemEval2027 \
+  --repo-type dataset \
+  --local-dir data/reteco_data
 ```
 
----
+Do not commit the full corpus to this repository. Refer to the official dataset page for current versions, licences and format details.
 
-## 5. Risorse Istituzionali e Riferimenti Ufficiali
+## Methodology overview
 
-* **Sito Web Ufficiale del Task:** [datascienceuibk.github.io/RETECO](https://www.google.com/search?q=https://datascienceuibk.github.io/RETECO/&utm_source=gemini)
-* **Repository GitHub Ufficiale:** [DataScienceUIBK/RETECO](https://www.google.com/search?q=https://github.com/DataScienceUIBK/RETECO&utm_source=gemini)
-* **Dataset Hugging Face (v1.1):** [DataScience-UIBK/RETECO-SemEval2027](https://www.google.com/search?q=https://huggingface.co/datasets/DataScience-UIBK/RETECO-SemEval2027&utm_source=gemini)
-* **Task Proposal Ufficiale (PDF):** [RETECO SemEval-2027 Proposal](https://www.google.com/search?q=https://datascienceuibk.github.io/RETECO/assets/papers/RETECO_SemEval_2027_Proposal.pdf&utm_source=gemini)
-* **Starter Kit Ufficiale (Baselines & Scorer):** [DataScienceUIBK/RETECO/starter_kit](https://www.google.com/search?q=https://github.com/DataScienceUIBK/RETECO/tree/main/starter_kit&utm_source=gemini)
-* **Mailing List dei Partecipanti:** [semeval-2027-reteco @ Google Groups](https://www.google.com/search?q=https://groups.google.com/g/semeval-2027-reteco&utm_source=gemini)
-* **Paper Scientifico di Riferimento RECOR:** [ACL Anthology 2026.findings-acl.129](https://www.google.com/url?sa=E&source=gmail&q=https://aclanthology.org/2026.findings-acl.129/)
+### Sub-track 2a — retrieve evidence
 
----
+The 2a pipeline combines a dense bi-encoder based on `BAAI/bge-base-en-v1.5` with a lexical BM25 candidate ranking. The dense encoder is fine-tuned contrastively using positive evidence and hard negatives; BM25 candidates can supply hard negatives during training. At inference, ranked lists can be combined through **Reciprocal Rank Fusion (RRF)**. The configuration and evaluation details are documented in the [2a README](subtrack_2a/README.md).
 
-## 6. Baseline di Riferimento Ufficiali
+### Sub-track 2b — generate from gold evidence
 
-Risultati ufficiali $nDCG@10$ (macro-average) pubblicati dagli organizzatori con modello BM25 standard ($k_1=0.9, b=0.4$):
+The 2b pipeline resolves `gold_doc_ids` to document text, prepares a prompt from the current turn, conversation history and gold passages, and fine-tunes an instruction-tuned causal language model using **Supervised Fine-Tuning (SFT)** with **LoRA/PEFT**. Optional CUDA 4-bit NF4 quantization enables QLoRA. Training labels are masked on prompt tokens so that the loss is computed on the answer target. More details and current experimental status are available in the [2b README](subtrack_2b/README.md).
 
-| Sub-track | Configurazione Query | Split Train | Split Dev |
-| --- | --- | --- | --- |
-| **2a Conversational Retrieval** | *Current turn only* (senza cronologia) | 0.1837 | 0.1827 |
-| **2a Conversational Retrieval** | *Turn + Conversation history* (dialogo completo) | **0.4539** | **0.4379** |
+## Quick start
 
-L'inclusione della cronologia conversazionale incrementa il punteggio di oltre **+139%**, attestando che il recupero contestualizzato è il fattore discriminante del task.
+Use the configuration and commands documented for each sub-track. A short smoke test should be run before launching a long training job.
 
----
+```bash
+# Sub-track 2a
+python subtrack_2a/train.py --config subtrack_2a/config/config.yaml
 
-## 7. Citazioni Ufficiali
+# Sub-track 2b: lightweight end-to-end sanity check
+python subtrack_2b/train.py \
+  --config subtrack_2b/config/config.yaml \
+  --smoke-test
+```
 
-Se utilizzi questo codice o i benchmark di riferimento, cita i lavori ufficiali di TEMPO e RECOR:
+Install dependencies into the cloud or local Python environment that you intend to use. For a GPU environment, retain the environment's compatible CUDA-enabled PyTorch build and follow the 2b README before enabling bitsandbytes quantization.
+
+## Evaluation and reproducibility
+
+- **2a:** use nDCG@10 for retrieval. Report the evaluated split, domain coverage, scorer, and whether the result is from dense retrieval, BM25, or fusion.
+- **2b:** the official plan reports five independent generation dimensions: correctness, completeness, relevance, conversational coherence, and faithfulness. ROUGE-L, METEOR and BERTScore are additional diagnostics, not substitutes for those judgments.
+- Keep train/internal-validation separation at conversation level wherever splitting is performed locally.
+- Do not use reference answers to construct inference prompts or select generation candidates.
+- Record model IDs, config, seed, token limits, quantization, hardware, checkpoint and run logs alongside every reported result.
+- **Do not compare a local partial-domain result with the official macro-average unless the split, domain coverage and scoring procedure match.**
+
+## Current status
+
+| Component | Status |
+|---|---|
+| 2a dense + BM25 + rank fusion pipeline | Implemented and evaluated in local experiments; the README reports only the result snapshot currently available. |
+| 2b data loading, gold-evidence resolution, prompt construction and SFT pipeline | Implemented and smoke-tested. |
+| 2b Qwen 7B QLoRA on a 16-GiB-class T4 | Initial long-sequence run hit CUDA OOM; lower-memory sequence and LoRA settings are being investigated. No official generation score is claimed. |
+
+## References
+
+### RECOR: the conversational retrieval benchmark
+
+Mohammed Ali, Abdelrahman Abdallah, Amit Agarwal, Hitesh Laxmichand Patel, and Adam Jatowt. **“RECOR: Reasoning-focused Multi-turn Conversational Retrieval Benchmark.”** *Findings of the Association for Computational Linguistics: ACL 2026*, pp. 2688–2723. [Paper](https://aclanthology.org/2026.findings-acl.129/) · [DOI](https://doi.org/10.18653/v1/2026.findings-acl.129) · [Code and benchmark](https://github.com/RECOR-Benchmark/RECOR).
 
 ```bibtex
-@inproceedings{ali2026recor,
-  title={{RECOR: Reasoning-focused Multi-turn Conversational Retrieval Benchmark}},
-  author={Ali, Mohammed and Abdallah, Abdelrahman and Agarwal, Amit and Patel, Hitesh Laxmichand and Jatowt, Adam},
-  booktitle={Findings of the Association for Computational Linguistics: ACL 2026},
-  pages={2688--2723},
-  year={2026},
-  publisher={Association for Computational Linguistics},
-  doi={10.18653/v1/2026.findings-acl.129},
-  url={https://aclanthology.org/2026.findings-acl.129/}
-}
-
-@article{abdallah2026tempo,
-  title={{TEMPO: A Realistic Multi-Domain Benchmark for Temporal Reasoning-Intensive Retrieval}},
-  author={Abdallah, Abdelrahman and Ali, Mohammed and Abdul-Mageed, Muhammad and Jatowt, Adam},
-  journal={arXiv preprint arXiv:2601.09523},
-  year={2026},
-  url={https://arxiv.org/abs/2601.09523}
+@inproceedings{ali-etal-2026-recor,
+  title     = {{RECOR}: Reasoning-focused Multi-turn Conversational Retrieval Benchmark},
+  author    = {Ali, Mohammed and Abdallah, Abdelrahman and Agarwal, Amit and Patel, Hitesh Laxmichand and Jatowt, Adam},
+  booktitle = {Findings of the Association for Computational Linguistics: ACL 2026},
+  pages     = {2688--2723},
+  year      = {2026},
+  publisher = {Association for Computational Linguistics},
+  doi       = {10.18653/v1/2026.findings-acl.129},
+  url       = {https://aclanthology.org/2026.findings-acl.129/}
 }
 ```
+
+For RETECO-specific task rules, data versions and evaluation details, cite and link the [official task website](https://datascienceuibk.github.io/RETECO/). Please also cite the upstream RECOR paper when using the conversational benchmark.
