@@ -1,52 +1,128 @@
 #!/usr/bin/env python3
-"""
-subtrack_2a/utils/utils.py
+"""Utility functions for RETECO SemEval-2027 Sub-track 2a.
 
-Funzioni di utilità per SemEval-2027 Sub-track 2a:
-  - Valutazione nDCG ufficiale conforme con penalizzazione topic mancanti (score 0.0).
-  - Reciprocal Rank Fusion ponderata.
-  - Scrittura e validazione formale TREC a 6 colonne.
+Includes safe configuration/JSON I/O, official nDCG@k evaluation, weighted
+Reciprocal Rank Fusion, TREC run writing/validation, reproducible seeds,
+logging, and optional training-history plotting.
 """
 
-import os
-import sys
-import yaml
+from __future__ import annotations
+
+import datetime as dt
 import json
 import logging
-from pathlib import Path
-import torch
-import matplotlib.pyplot as plt
-import datetime 
+import math
 import random
-from typing import Dict, List, Tuple, Any, Optional, Union
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-import pytrec_eval
 import numpy as np
+import torch
+import yaml
 
 
-def load_config(config_path: Path) -> Dict[str, Any]:
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+# =============================================================================
+# Configuration and JSON I/O
+# =============================================================================
+
+def load_config(config_path: Union[str, Path]) -> Dict[str, Any]:
+    """Load a YAML config and ensure its root is a mapping."""
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config non trovato: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError(f"La root del config YAML deve essere una mappa: {path}")
+    return config
 
 
-def save_json(data, path):
-    def make_json_safe(obj):
-        if isinstance(obj, torch.Tensor):
-            obj = obj.detach().cpu()
-            return obj.item() if obj.numel() == 1 else obj.tolist()
-
-        if isinstance(obj, dict):
-            return {k: make_json_safe(v) for k, v in obj.items()}
-
-        if isinstance(obj, (list, tuple)):
-            return [make_json_safe(v) for v in obj]
-
+def _json_safe(obj: Any) -> Any:
+    """Convert common scientific Python values into strict JSON values."""
+    if isinstance(obj, torch.Tensor):
+        tensor = obj.detach().cpu()
+        return tensor.item() if tensor.numel() == 1 else tensor.tolist()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return _json_safe(obj.item())
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, torch.device):
+        return str(obj)
+    if isinstance(obj, dt.datetime):
+        return obj.isoformat()
+    if isinstance(obj, dt.date):
+        return obj.isoformat()
+    if isinstance(obj, Mapping):
+        return {str(key): _json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(value) for value in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
+    # Avoid serializing arbitrary objects using an unstable repr by default.
+    raise TypeError(f"Tipo non serializzabile in JSON: {type(obj).__name__}")
 
-    data = make_json_safe(data)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+def save_json(data: Any, path: Union[str, Path], *, indent: int = 2) -> None:
+    """Atomically write strict JSON and create parent directories."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_data = _json_safe(data)
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(safe_data, handle, indent=indent, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")
+        temp_path.replace(output_path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+# =============================================================================
+# Official-style metric
+# =============================================================================
+
+def _normalize_qrels(qrels: Mapping[Any, Mapping[Any, Any]]) -> Dict[str, Dict[str, int]]:
+    normalized: Dict[str, Dict[str, int]] = {}
+    for topic_id, docs in qrels.items():
+        topic = str(topic_id)
+        normalized[topic] = {str(doc_id): int(rel) for doc_id, rel in docs.items()}
+    return normalized
+
+
+def _normalize_run(run: Mapping[Any, Any]) -> Dict[str, Dict[str, float]]:
+    """Accept pytrec_eval score maps or ordered (doc_id, score) rankings."""
+    normalized: Dict[str, Dict[str, float]] = {}
+    for topic_id, docs in run.items():
+        topic = str(topic_id)
+        result: Dict[str, float] = {}
+        if isinstance(docs, Mapping):
+            iterator = docs.items()
+        else:
+            iterator = docs or []
+        for item in iterator:
+            try:
+                doc_id, score = item
+                score_value = float(score)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Run malformata per topic {topic}: {item!r}") from exc
+            if not math.isfinite(score_value):
+                continue
+            doc = str(doc_id)
+            # If a malformed input repeats the same doc, retain its best score.
+            result[doc] = max(result.get(doc, -math.inf), score_value)
+        normalized[topic] = result
+    return normalized
 
 
 def compute_official_ndcg(
@@ -54,259 +130,393 @@ def compute_official_ndcg(
     run: Dict[str, Dict[str, float]],
     cutoff: int = 10,
 ) -> Dict[str, float]:
+    """Compute nDCG@cutoff with ``pytrec_eval``.
+
+    All topics in qrels contribute to the mean. A topic absent from the run
+    explicitly receives 0.0, preventing a partial run from improving its score
+    by omitting difficult queries. qrels should be the judgments for the exact
+    split being evaluated; do not replace them with training annotations.
     """
-    Calcola nDCG@K ufficiale tramite pytrec_eval.
-    CONFORMITÀ UFFICIALE: Qualsiasi topic presente nei qrels ma assente
-    nella run riceve rigorosamente score 0.0.
-    """
+    cutoff = int(cutoff)
+    if cutoff <= 0:
+        raise ValueError("cutoff deve essere > 0.")
     if not qrels:
         return {f"ndcg_cut_{cutoff}": 0.0}
 
-    evaluator = pytrec_eval.RelevanceEvaluator(qrels, {f"ndcg_cut_{cutoff}"})
-    # Valuta solo i topic presenti nella run
-    raw_scores = evaluator.evaluate(run)
+    normalized_qrels = _normalize_qrels(qrels)
+    normalized_run = _normalize_run(run)
 
-    # I topic mancanti nei qrels ricevono 0.0
-    all_ndcg = []
-    for topic_id in qrels.keys():
-        if topic_id in raw_scores:
-            all_ndcg.append(raw_scores[topic_id].get(f"ndcg_cut_{cutoff}", 0.0))
-        else:
-            all_ndcg.append(0.0)
+    try:
+        import pytrec_eval
+    except ImportError as exc:
+        raise ImportError(
+            "compute_official_ndcg richiede pytrec_eval; installa la dipendenza "
+            "prevista dal kit ufficiale RETECO."
+        ) from exc
 
-    mean_score = float(np.mean(all_ndcg)) if all_ndcg else 0.0
-    return {f"ndcg_cut_{cutoff}": mean_score}
+    metric_name = f"ndcg_cut_{cutoff}"
+    evaluator = pytrec_eval.RelevanceEvaluator(normalized_qrels, {metric_name})
+    raw_scores = evaluator.evaluate(normalized_run)
 
+    # TREC evaluator versions can differ on the treatment of topics omitted
+    # from run. The explicit qrels-key loop makes our convention deterministic.
+    topic_scores: List[float] = []
+    for topic_id in normalized_qrels:
+        score = raw_scores.get(topic_id, {}).get(metric_name, 0.0)
+        score = float(score)
+        topic_scores.append(score if math.isfinite(score) else 0.0)
+
+    mean_score = float(np.mean(topic_scores)) if topic_scores else 0.0
+    return {metric_name: mean_score}
+
+
+# =============================================================================
+# Reciprocal Rank Fusion
+# =============================================================================
 
 def reciprocal_rank_fusion(
-    runs: List[Dict[str, List[Tuple[str, float]]]],
-    k: int = 30,
-    weights: Optional[List[float]] = None,
+    runs: Sequence[Mapping[str, Sequence[Tuple[str, float]]]],
+    k: int = 60,
+    weights: Optional[Sequence[float]] = None,
     top_n: int = 100,
 ) -> Dict[str, List[Tuple[str, float]]]:
-    """Reciprocal Rank Fusion ponderata con k ottimizzato."""
+    """Fuse ranked lists with (optionally weighted) Reciprocal Rank Fusion.
+
+    ``RRF(d) = sum_m weight_m / (k + rank_m(d))``
+
+    A run is a mapping ``topic_id -> [(doc_id, score), ...]``. Input lists are
+    re-sorted by score descending for safety, duplicate doc IDs within one run
+    count only at their first rank, and ties in the final score are broken by
+    document ID for reproducibility. The ``weights`` argument is preserved
+    from the earlier public API; when omitted, all runs receive weight 1.
+    """
+    if int(k) < 1:
+        raise ValueError("k deve essere >= 1.")
+    if int(top_n) < 0:
+        raise ValueError("top_n deve essere >= 0.")
+    if not runs:
+        return {}
+
     if weights is None:
-        weights = [1.0] * len(runs)
-    elif len(weights) != len(runs):
-        raise ValueError("I pesi devono corrispondere al numero di liste run.")
+        run_weights = [1.0] * len(runs)
+    else:
+        if len(weights) != len(runs):
+            raise ValueError("I pesi devono corrispondere al numero di run.")
+        run_weights = [float(weight) for weight in weights]
+        if any(not math.isfinite(weight) or weight < 0 for weight in run_weights):
+            raise ValueError("I pesi RRF devono essere finiti e non negativi.")
 
-    all_topics = set()
-    for r in runs:
-        all_topics.update(r.keys())
+    all_topics: set[str] = set()
+    for run in runs:
+        all_topics.update(str(topic_id) for topic_id in run.keys())
 
-    fused_run: Dict[str, List[Tuple[str, float]]] = {}
-    for tid in all_topics:
-        scores = {}
-        for r_idx, r in enumerate(runs):
-            w = weights[r_idx]
-            q_list = r.get(tid, [])
-            for rank, (doc_id, _) in enumerate(q_list, 1):
-                scores[doc_id] = scores.get(doc_id, 0.0) + w * (1.0 / (k + rank))
+    fused: Dict[str, Dict[str, float]] = {topic_id: {} for topic_id in all_topics}
+    for run, weight in zip(runs, run_weights):
+        if weight == 0:
+            continue
+        for raw_topic, raw_ranking in run.items():
+            topic_id = str(raw_topic)
+            if isinstance(raw_ranking, Mapping):
+                ranking = list(raw_ranking.items())
+            else:
+                ranking = list(raw_ranking or [])
+            # Inputs are intended as scored rankings. Sorting here preserves
+            # compatibility with older callers that didn't pre-sort them.
+            normalized: List[Tuple[str, float]] = []
+            for entry in ranking:
+                if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+                    raise ValueError(f"Ranking malformato per topic {topic_id}: {entry!r}")
+                doc_id, raw_score = entry
+                try:
+                    score = float(raw_score)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Score non numerico nel topic {topic_id}: {raw_score!r}") from exc
+                if math.isfinite(score):
+                    normalized.append((str(doc_id), score))
+            normalized.sort(key=lambda item: item[1], reverse=True)
 
-        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
-        fused_run[tid] = sorted_docs
+            seen_docs: set[str] = set()
+            rank = 0
+            for doc_id, _score in normalized:
+                if doc_id in seen_docs:
+                    continue
+                seen_docs.add(doc_id)
+                rank += 1
+                fused[topic_id][doc_id] = fused[topic_id].get(doc_id, 0.0) + (
+                    weight / (int(k) + rank)
+                )
 
-    return fused_run
+    output: Dict[str, List[Tuple[str, float]]] = {}
+    for topic_id in sorted(fused):
+        ranked = sorted(
+            fused[topic_id].items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        output[topic_id] = ranked[: int(top_n)]
+    return output
 
+
+# =============================================================================
+# TREC run output and validation
+# =============================================================================
 
 def write_trec_run(
-    run_dict: Dict[str, List[Tuple[str, float]]],
-    output_path: Path,
+    run_dict: Mapping[str, Sequence[Tuple[str, float]]],
+    output_path: Union[str, Path],
     run_tag: str = "reteco_run",
     max_k: int = 10,
-):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        for topic_id in sorted(run_dict.keys()):
-            doc_scores = run_dict[topic_id][:max_k]
-            for rank, (doc_id, score) in enumerate(doc_scores, 1):
-                f.write(f"{topic_id} Q0 {doc_id} {rank} {score:.6f} {run_tag}\n")
+) -> None:
+    """Write an ordered six-column TREC run file."""
+    max_k = int(max_k)
+    if max_k < 0:
+        raise ValueError("max_k deve essere >= 0.")
+    run_tag = str(run_tag).strip()
+    if not run_tag or any(character.isspace() for character in run_tag):
+        raise ValueError("run_tag deve essere non vuoto e senza spazi.")
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        ordered_topics = sorted(run_dict.items(), key=lambda pair: str(pair[0]))
+        for raw_topic_id, ranking in ordered_topics:
+            topic_id = str(raw_topic_id)
+            seen: set[str] = set()
+            rank = 0
+            for item in list(ranking or [])[:max_k]:
+                if not isinstance(item, (tuple, list)) or len(item) != 2:
+                    raise ValueError(f"Ranking malformato per topic {topic_id}: {item!r}")
+                doc_id, raw_score = item
+                topic = str(topic_id)
+                doc = str(doc_id)
+                if not topic or not doc or any(ch.isspace() for ch in topic + doc):
+                    raise ValueError("topic_id e doc_id TREC devono essere non vuoti e senza spazi.")
+                if doc in seen:
+                    continue
+                score = float(raw_score)
+                if not math.isfinite(score):
+                    continue
+                seen.add(doc)
+                rank += 1
+                handle.write(f"{topic} Q0 {doc} {rank} {score:.8f} {run_tag}\n")
 
 
-def validate_trec_file(trec_path: Path, max_rank: int = 10) -> Tuple[bool, List[str]]:
-    errors = []
-    if not trec_path.exists():
+def validate_trec_file(
+    trec_path: Union[str, Path],
+    max_rank: int = 10,
+) -> Tuple[bool, List[str]]:
+    """Validate six-column TREC rows, finite scores, ranks and duplicate docs."""
+    path = Path(trec_path)
+    if not path.exists():
         return False, ["File TREC non esistente."]
 
-    seen_topics = set()
-    topic_ranks = {}
+    errors: List[str] = []
+    ranks_by_topic: Dict[str, List[int]] = {}
+    seen_docs: Dict[str, set[str]] = {}
 
-    with open(trec_path, "r", encoding="utf-8") as f:
-        for idx, line in enumerate(f, 1):
-            parts = line.strip().split()
-            if len(parts) != 6:
-                errors.append(f"Riga {idx}: Formato a 6 colonne violato ({len(parts)} colonne).")
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError as exc:
+        return False, [f"Impossibile leggere il file TREC: {exc}"]
+
+    with handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
                 continue
-            t_id, _, d_id, rank_str, _, _ = parts
-            rank = int(rank_str)
-            if rank > max_rank:
-                errors.append(f"Riga {idx}: Rango {rank} > max_rank {max_rank}.")
+            parts = line.split()
+            if len(parts) != 6:
+                errors.append(
+                    f"Riga {line_no}: formato a 6 colonne violato ({len(parts)} colonne)."
+                )
+                continue
+            topic_id, q0, doc_id, rank_text, score_text, run_tag = parts
+            if q0 != "Q0":
+                errors.append(f"Riga {line_no}: la seconda colonna deve essere Q0.")
+            if not run_tag:
+                errors.append(f"Riga {line_no}: run_tag vuoto.")
+            try:
+                rank = int(rank_text)
+                if rank <= 0:
+                    raise ValueError
+            except ValueError:
+                errors.append(f"Riga {line_no}: rango non valido {rank_text!r}.")
+                continue
+            try:
+                score = float(score_text)
+                if not math.isfinite(score):
+                    raise ValueError
+            except ValueError:
+                errors.append(f"Riga {line_no}: score non finito/non numerico {score_text!r}.")
+                continue
+            if rank > int(max_rank):
+                errors.append(f"Riga {line_no}: rango {rank} > max_rank {max_rank}.")
 
-            topic_ranks.setdefault(t_id, []).append(rank)
+            ranks_by_topic.setdefault(topic_id, []).append(rank)
+            docs = seen_docs.setdefault(topic_id, set())
+            if doc_id in docs:
+                errors.append(f"Riga {line_no}: doc_id duplicato {doc_id!r} per topic {topic_id!r}.")
+            docs.add(doc_id)
 
-    for tid, ranks in topic_ranks.items():
-        if ranks != list(range(1, len(ranks) + 1)):
-            errors.append(f"Topic {tid}: Ranghi non ordinati sequenzialmente 1..{len(ranks)}.")
+    for topic_id, ranks in ranks_by_topic.items():
+        expected = list(range(1, len(ranks) + 1))
+        if ranks != expected:
+            errors.append(
+                f"Topic {topic_id}: ranghi non sequenziali nell'ordine del file; "
+                f"atteso {expected}, trovato {ranks}."
+            )
+    return not errors, errors
 
-    return len(errors) == 0, errors
 
+# =============================================================================
+# Logging and reproducibility
+# =============================================================================
 
-# =========================================================================
-# 4. Fusione Risultati: Reciprocal Rank Fusion (RRF)
-# =========================================================================
+def setup_logger(
+    log_dir: Union[str, Path],
+    run_tag: str,
+    log_level: str = "INFO",
+) -> logging.Logger:
+    """Configure console + timestamped file logging.
 
-def reciprocal_rank_fusion(
-    runs: List[Dict[str, List[Tuple[str, float]]]],
-    k: int = 60,
-    top_n: int = 100,
-) -> Dict[str, List[Tuple[str, float]]]:
+    Fixes the previous ``datetime.now`` error (datetime was imported as a
+    module) which was caught by the caller and silently disabled file logging.
     """
-    Combina graduatorie multiple (es. BM25 e Bi-Encoder denso) con la formula standard RRF:
-        RRF_Score(d) = sum( 1 / (k + rank_m(d)) )
-    """
-    fused_scores: Dict[str, Dict[str, float]] = {}
+    directory = Path(log_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_tag = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(run_tag)).strip("._-")
+    if not safe_tag:
+        safe_tag = "reteco_2a"
 
-    for single_run in runs:
-        for topic_id, ranked_list in single_run.items():
-            fused_scores.setdefault(topic_id, {})
-            # Assicura l'ordine corretto
-            sorted_docs = sorted(ranked_list, key=lambda x: x[1], reverse=True)
-            for rank_idx, (doc_id, _) in enumerate(sorted_docs, start=1):
-                fused_scores[topic_id][doc_id] = fused_scores[topic_id].get(doc_id, 0.0) + (1.0 / (k + rank_idx))
-
-    final_run: Dict[str, List[Tuple[str, float]]] = {}
-    for topic_id, doc_dict in fused_scores.items():
-        sorted_candidates = sorted(doc_dict.items(), key=lambda x: x[1], reverse=True)[:top_n]
-        final_run[topic_id] = sorted_candidates
-
-    return final_run
-
-
-# ==============================================================================
-# 5. Configurazione del Logging Professionale
-# ==============================================================================
-
-def setup_logger(log_dir: Path, run_tag: str, log_level: str = "INFO") -> logging.Logger:
-    """Inizializza un logger con formattazione dettagliata su console e file."""
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"train_{run_tag}_{timestamp}.log"
-
-    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+    level = getattr(logging, str(log_level).upper(), logging.INFO)
     logger = logging.getLogger("RETECO_2A_Train")
-    logger.setLevel(numeric_level)
+    logger.setLevel(level)
     logger.propagate = False
 
-    # Pulisce eventuali handler precedenti
-    if logger.hasHandlers():
-        logger.handlers.clear()
+    # Close previous handlers before replacing them, avoiding duplicated logs
+    # and leaking file descriptors when this is called more than once.
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
 
     formatter = logging.Formatter(
         fmt="[%(asctime)s] [%(levelname)-8s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    # Handler su Console
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(numeric_level)
+    console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # Handler su File
+    log_file = directory / f"{safe_tag}_{timestamp}.log"
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(numeric_level)
+    file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-
-    logger.info(f"Logger inizializzato. File di log: {log_file}")
+    logger.info("Logger inizializzato. File di log: %s", log_file)
     return logger
 
 
 def set_seed(seed: int = 42) -> None:
-    """Garantisce la totale riproducibilità numerica su CPU e GPU."""
+    """Seed the common Python, NumPy and PyTorch RNGs."""
+    seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
-# =========================================================================
-# 5. Visualizzazione Grafica Addestramento
-# =========================================================================
+
+# =============================================================================
+# Optional training-history visualization
+# =============================================================================
 
 def plot_training_history(
-    history: Dict[str, List[float]],
+    history: Any,
     output_path: Union[str, Path],
     title: str = "Training Progress Sub-track 2a",
 ) -> None:
-    """Traccia e salva su disco l'andamento di Loss ed eventuale Validation nDCG."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("RETECO_2A_Train")
+    """Plot train loss and validation nDCG from either legacy or new history.
 
-    epochs = range(1, len(history.get("train_loss", [])) + 1)
-    if not epochs:
-        logger.warning("Nessun dato di loss presente nella cronologia per generare il grafico.")
+    Supports the legacy mapping ``{'train_loss': [...], 'val_ndcg': [...]}``
+    and the current train.py list of per-epoch records with ``training.loss``
+    and ``validation.macro_average.nDCG@10``.
+    Matplotlib is imported lazily because plotting is optional during training.
+    """
+    logger = logging.getLogger("RETECO_2A_Train")
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(history, Mapping):
+        train_losses = list(history.get("train_loss", []))
+        val_ndcgs = list(history.get("val_ndcg", []))
+    elif isinstance(history, list):
+        train_losses = []
+        val_ndcgs = []
+        for record in history:
+            if not isinstance(record, Mapping):
+                continue
+            train = record.get("training", {})
+            validation = record.get("validation", {})
+            macro = validation.get("macro_average", {}) if isinstance(validation, Mapping) else {}
+            train_losses.append(train.get("loss") if isinstance(train, Mapping) else None)
+            val_ndcgs.append(macro.get("nDCG@10") if isinstance(macro, Mapping) else None)
+        while train_losses and train_losses[-1] is None:
+            train_losses.pop()
+        while val_ndcgs and val_ndcgs[-1] is None:
+            val_ndcgs.pop()
+    else:
+        logger.warning("Formato history non supportato; grafico non generato.")
         return
 
-    fig, ax1 = plt.subplots(figsize=(8, 5))
+    if not train_losses:
+        logger.warning("Nessuna train loss nella cronologia; grafico non generato.")
+        return
 
-    color = "tab:red"
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError("plot_training_history richiede matplotlib.") from exc
+
+    epochs = np.arange(1, len(train_losses) + 1)
+    fig, ax1 = plt.subplots(figsize=(8, 5))
     ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Train Loss", color=color)
-    ax1.plot(epochs, history["train_loss"], color=color, marker="o", linewidth=2, label="Train Loss")
-    ax1.tick_params(axis="y", labelcolor=color)
+    ax1.set_ylabel("Train Loss")
+    ax1.plot(epochs, train_losses, marker="o", linewidth=2, label="Train Loss")
     ax1.grid(True, linestyle="--", alpha=0.5)
 
-    if "val_ndcg" in history and history["val_ndcg"]:
+    valid_vals = [value for value in val_ndcgs if value is not None]
+    if valid_vals:
         ax2 = ax1.twinx()
-        color = "tab:blue"
-        ax2.set_ylabel("Validation nDCG@10", color=color)
-        ax2.plot(epochs, history["val_ndcg"], color=color, marker="s", linewidth=2, label="Val nDCG@10")
-        ax2.tick_params(axis="y", labelcolor=color)
+        val_epochs = np.arange(1, len(valid_vals) + 1)
+        ax2.set_ylabel("Validation nDCG@10")
+        ax2.plot(val_epochs, valid_vals, marker="s", linewidth=2, label="Val nDCG@10")
 
-    plt.title(title)
+    fig.suptitle(title)
     fig.tight_layout()
-    plt.savefig(output_path, dpi=300)
-    plt.close()
-    logger.info(f"Grafico salvato con successo in: {output_path}")
+    fig.savefig(output, dpi=200)
+    plt.close(fig)
+    logger.info("Grafico salvato: %s", output)
 
-
-# =========================================================================
-# Test Unitario Diretto
-# =========================================================================
 
 if __name__ == "__main__":
-    print("Inizializzazione test unitario di utils.py...")
-
-    dummy_qrels = {
-        "conv_1_turn_1": {"doc_A": 1, "doc_B": 0},
-        "conv_1_turn_2": {"doc_C": 1},
+    print("Smoke test delle utility RETECO Sub-track 2a")
+    qrels = {"conv_1_turn_1": {"doc_A": 1}, "conv_1_turn_2": {"doc_C": 1}}
+    run = {
+        "conv_1_turn_1": {"doc_A": 12.5, "doc_X": 2.1},
+        # Deliberatamente manca conv_1_turn_2: deve contribuire con 0.0.
     }
-    dummy_run = {
-        "conv_1_turn_1": {"doc_A": 12.5, "doc_B": 8.0, "doc_X": 2.1},
-        "conv_1_turn_2": {"doc_Y": 15.0, "doc_C": 9.2},
-    }
+    print("nDCG:", compute_official_ndcg(qrels, run, cutoff=10))
 
-    metrics = compute_official_ndcg(dummy_qrels, dummy_run, cutoff=10)
-    print(f"✓ Calcolo metrica completato: {metrics}")
-
-    test_trec_file = Path("test_run.trec")
-    converted_run = {
-        topic: sorted(docs.items(), key=lambda x: x[1], reverse=True)
-        for topic, docs in dummy_run.items()
-    }
-    write_trec_run(converted_run, test_trec_file, run_tag="test_run", max_k=2)
-
-    valid, errs = validate_trec_file(test_trec_file, max_rank=2)
-    print(f"✓ Validazione file TREC: {'Corretto' if valid else 'Fallito'}")
-    if errs:
-        for err in errs:
-            print(f"  [Errore trovato]: {err}")
-
-    if test_trec_file.exists():
-        test_trec_file.unlink()
-    print("Test completato.")
+    test_path = Path("test_run.trec")
+    try:
+        write_trec_run({"conv_1_turn_1": [("doc_A", 1.0), ("doc_B", 0.5)]}, test_path, max_k=2)
+        valid, errors = validate_trec_file(test_path, max_rank=2)
+        print("TREC validation:", "OK" if valid else "FAILED", errors)
+    finally:
+        test_path.unlink(missing_ok=True)

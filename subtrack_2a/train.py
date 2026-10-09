@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
-"""
-subtrack_2a/train.py
+"""Training pipeline RETECO SemEval-2027 Sub-track 2a.
+
+Nuova configurazione:
+    1. legge esclusivamente benchmark_train e il corpus RETECO ufficiale;
+    2. crea una validation interna con split a livello di conversazione;
+    3. genera/cache-a query autonome solo per il sottoinsieme di training;
+    4. mina hard negative BM25 usando query senza istruzione del dense encoder;
+    5. addestra Qwen3-Embedding-0.6B con LoRA e InfoNCE;
+    6. seleziona il checkpoint tramite nDCG@10 sulla validation interna.
+
+La generazione delle query è separata dal Dataset/DataLoader. Il modello generativo
+viene scaricato dalla GPU prima di caricare il bi-encoder.
 """
 
 from __future__ import annotations
@@ -13,11 +23,12 @@ import logging
 import math
 import os
 import random
+import re
 import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -32,168 +43,178 @@ from dataset.dataset import (
     ConversationalCollateFn,
     DomainBalancedBatchSampler,
     RETECO2aTrainDataset,
+    load_query_rewrites,
     load_track2_domain_data,
+    save_query_rewrites,
     split_conversations_train_val,
 )
-
-from models.model import ConversationalBiEncoder
-
+from models.model import ConversationalBiEncoder, ConversationalQueryRewriter
 from retrieval.retrieval import mine_bm25_hard_negatives
+from utils.utils import compute_official_ndcg, load_config, save_json, setup_logger, set_seed
 
-from utils.utils import (
-    compute_official_ndcg,
-    load_config,
-    save_json,
-    setup_logger,
-)
-
-
-# =============================================================================
-# Logging
-# =============================================================================
 
 logger = logging.getLogger("RETECO_Train")
-
 if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
         logging.Formatter(
             "[%(asctime)s] [%(levelname)-8s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
-    logger.addHandler(handler)
-
+    logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
 
 
 # =============================================================================
-# Reproducibility
+# Reproducibility / device helpers
 # =============================================================================
 
-def set_seed(seed: int) -> None:
-    """Imposta i principali RNG utilizzati dalla pipeline."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# =============================================================================
-# Device
-# =============================================================================
-
-def resolve_device(
-    requested: str,
-) -> torch.device:
-    """
-    Risolve il device richiesto.
-
-    Supporta:
-        auto
-        cuda
-        mps
-        cpu
-    """
-    requested = requested.lower().strip()
-
+def resolve_device(requested: str) -> torch.device:
+    requested = str(requested).lower().strip()
     if requested == "cpu":
         return torch.device("cpu")
-
     if requested == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError(
-                "Device CUDA richiesto ma CUDA non è disponibile."
-            )
+            raise RuntimeError("CUDA richiesto ma non disponibile.")
         return torch.device("cuda")
-
     if requested == "mps":
-        if not (
-            hasattr(torch.backends, "mps")
-            and torch.backends.mps.is_available()
-        ):
-            raise RuntimeError(
-                "Device MPS richiesto ma MPS non è disponibile."
-            )
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            raise RuntimeError("MPS richiesto ma non disponibile.")
         return torch.device("mps")
-
-    # auto
+    if requested != "auto":
+        raise ValueError("general.device deve essere uno tra auto, cuda, mps, cpu.")
     if torch.cuda.is_available():
         return torch.device("cuda")
-
-    if (
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-    ):
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
-
     return torch.device("cpu")
 
 
-def autocast_context(
-    device: torch.device,
-    enabled: bool,
-):
-    """
-    Context manager AMP.
-
-    Per il nostro workflow:
-        CUDA -> FP16
-        MPS  -> FP32
-        CPU  -> FP32
-    """
+def autocast_context(device: torch.device, enabled: bool):
     if enabled and device.type == "cuda":
-        return torch.amp.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-        )
-
+        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
 
 
 def clear_device_cache(device: torch.device) -> None:
-    """Libera memoria non più necessaria."""
     gc.collect()
-
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
-    elif device.type == "mps":
-        if hasattr(torch, "mps") and hasattr(
-            torch.mps,
-            "empty_cache",
-        ):
-            torch.mps.empty_cache()
+
+def count_parameters(model: torch.nn.Module) -> Dict[str, int]:
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    return {"total": int(total), "trainable": int(trainable), "frozen": int(total - trainable)}
+
+
+def safe_component(value: str) -> str:
+    """Produce una componente filename corta e innocua."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-") or "default"
 
 
 # =============================================================================
-# Model statistics
+# Query rewriting: precompute/cache, outside DataLoader workers
 # =============================================================================
 
-def count_parameters(
-    model: torch.nn.Module,
-) -> Dict[str, int]:
-    """Conta parametri totali e trainabili."""
-    total = sum(
-        p.numel()
-        for p in model.parameters()
-    )
+def prepare_query_rewrites(
+    *,
+    domains: List[str],
+    train_samples_by_domain: Dict[str, List[ConversationalTurnSample]],
+    formatter: ContextAwareQueryFormatter,
+    paths_cfg: Dict[str, Any],
+    rewrite_cfg: Dict[str, Any],
+    seed: int,
+    val_ratio: float,
+) -> Dict[str, Dict[str, str]]:
+    """Restituisce una cache per dominio e genera solo le riscritture mancanti."""
+    cache_root = Path(paths_cfg.get("query_rewrites_cache_dir", "data/cache/query_rewrites/subtrack_2a"))
+    cache_root.mkdir(parents=True, exist_ok=True)
 
-    trainable = sum(
-        p.numel()
-        for p in model.parameters()
-        if p.requires_grad
-    )
+    rewrite_model_name = str(rewrite_cfg.get("model_name_or_path", ConversationalQueryRewriter.DEFAULT_MODEL_NAME))
+    cache_tag = safe_component(str(rewrite_cfg.get("cache_tag", "query_rewrite_v1")))
+    seed_tag = f"seed{seed}_val{int(round(val_ratio * 100)):02d}"
+    overwrite = bool(rewrite_cfg.get("overwrite_cache", False))
 
-    frozen = total - trainable
+    rewrites_by_domain: Dict[str, Dict[str, str]] = {}
+    rewriter: Optional[ConversationalQueryRewriter] = None
 
-    return {
-        "total": int(total),
-        "trainable": int(trainable),
-        "frozen": int(frozen),
-    }
+    for domain in domains:
+        train_samples = train_samples_by_domain[domain]
+        cache_path = cache_root / f"{safe_component(domain)}_{seed_tag}_{cache_tag}.json"
+
+        if cache_path.exists() and not overwrite:
+            existing = load_query_rewrites(cache_path)
+        else:
+            existing = {}
+
+        missing = [sample for sample in train_samples if sample.topic_id not in existing]
+        if overwrite:
+            missing = list(train_samples)
+            existing = {}
+
+        logger.info(
+            f"[REWRITE/{domain}] train samples={len(train_samples)} | "
+            f"cached={len(train_samples) - len(missing)} | missing={len(missing)}"
+        )
+
+        if missing:
+            if not bool(rewrite_cfg.get("enabled", True)):
+                raise RuntimeError(
+                    "query_mode richiede query riscritte ma query_rewriting.enabled=false."
+                )
+            if rewriter is None:
+                logger.info("Loading conversational query rewriter: %s", rewrite_model_name)
+                rewriter = ConversationalQueryRewriter(
+                    model_name_or_path=rewrite_model_name,
+                    torch_dtype=str(rewrite_cfg.get("torch_dtype", "float16")),
+                    device=None,
+                    device_map=rewrite_cfg.get("device_map", "auto"),
+                    load_in_4bit=bool(rewrite_cfg.get("load_in_4bit", True)),
+                    max_new_tokens=int(rewrite_cfg.get("max_new_tokens", 64)),
+                    max_input_tokens=int(rewrite_cfg.get("max_input_tokens", 4096)),
+                    max_history_tokens=int(rewrite_cfg.get("max_history_tokens", 3000)),
+                    trust_remote_code=bool(rewrite_cfg.get("trust_remote_code", False)),
+                )
+
+            updated = rewriter.rewrite_samples(
+                missing,
+                existing=existing,
+                overwrite=False,
+            )
+            metadata = {
+                "purpose": "subtrack_2a_training_query_rewrites",
+                "domain": domain,
+                "source_split": "benchmark_train.json",
+                "internal_train_seed": seed,
+                "internal_validation_ratio": val_ratio,
+                "generator_model": rewrite_model_name,
+                "cache_tag": cache_tag,
+                "deterministic_decoding": True,
+                "prompt_version": "ConversationalQueryRewriter.SYSTEM_PROMPT/v1",
+            }
+            save_query_rewrites(cache_path, updated, metadata=metadata)
+            existing = updated
+            logger.info("[REWRITE/%s] saved %d rewrites to %s", domain, len(existing), cache_path)
+
+        missing_after = [sample.topic_id for sample in train_samples if not existing.get(sample.topic_id, "").strip()]
+        if missing_after:
+            raise RuntimeError(
+                f"Cache riscritture incompleta per {domain}: {len(missing_after)} query mancanti."
+            )
+
+        rewrites_by_domain[domain] = existing
+
+    # Importante per GPU da 16 GB: liberare il generatore prima di caricare l'encoder.
+    if rewriter is not None:
+        del rewriter
+        clear_device_cache(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        logger.info("Query rewriter released before loading the dense encoder.")
+
+    return rewrites_by_domain
 
 
 # =============================================================================
@@ -204,67 +225,24 @@ def summarize_training_datasets(
     domain_datasets: Dict[str, RETECO2aTrainDataset],
     hard_negative_maps: Dict[str, Dict[str, List[str]]],
 ) -> Dict[str, Any]:
-    """Produce diagnostica strutturale dei dataset di training."""
-
-    report: Dict[str, Any] = {
-        "domains": {},
-        "total_samples": 0,
-    }
-
+    report: Dict[str, Any] = {"domains": {}, "total_samples": 0}
     for domain, dataset in domain_datasets.items():
         samples = dataset.valid_samples
         hard_map = hard_negative_maps.get(domain, {})
-
-        gold_counts = [
-            len(sample.gold_doc_ids)
-            for sample in samples
-        ]
-
-        hard_counts = [
-            len(hard_map.get(sample.topic_id, []))
-            for sample in samples
-        ]
-
-        missing_hard = sum(
-            count < dataset.negatives_per_positive
-            for count in hard_counts
-        )
-
+        gold_counts = [len(sample.gold_doc_ids) for sample in samples]
+        hard_counts = [len(hard_map.get(sample.topic_id, [])) for sample in samples]
         report["domains"][domain] = {
             "num_samples": len(samples),
-            "num_unique_conversations": len(
-                {
-                    s.conversation_id
-                    for s in samples
-                }
-            ),
-            "avg_gold_per_sample": (
-                float(np.mean(gold_counts))
-                if gold_counts
-                else 0.0
-            ),
-            "max_gold_per_sample": (
-                int(max(gold_counts))
-                if gold_counts
-                else 0
-            ),
-            "avg_mined_hard_negatives": (
-                float(np.mean(hard_counts))
-                if hard_counts
-                else 0.0
-            ),
-            "min_mined_hard_negatives": (
-                int(min(hard_counts))
-                if hard_counts
-                else 0
-            ),
+            "num_unique_conversations": len({sample.conversation_id for sample in samples}),
+            "avg_gold_per_sample": float(np.mean(gold_counts)) if gold_counts else 0.0,
+            "avg_mined_hard_negatives": float(np.mean(hard_counts)) if hard_counts else 0.0,
+            "min_mined_hard_negatives": int(min(hard_counts)) if hard_counts else 0,
             "samples_below_requested_negative_count": int(
-                missing_hard
+                sum(count < dataset.negatives_per_positive for count in hard_counts)
             ),
+            **dataset.get_diagnostics(),
         }
-
         report["total_samples"] += len(samples)
-
     return report
 
 
@@ -272,983 +250,376 @@ def summarize_training_datasets(
 # Validation
 # =============================================================================
 
+@torch.inference_mode()
 def evaluate_dense_validation_per_domain(
+    *,
     model: ConversationalBiEncoder,
-    val_samples_by_domain: Dict[
-        str,
-        List[ConversationalTurnSample],
-    ],
+    val_samples_by_domain: Dict[str, List[ConversationalTurnSample]],
     corpus_by_domain: Dict[str, Dict[str, str]],
-    qrels_by_domain: Dict[
-        str,
-        Dict[str, Dict[str, int]],
-    ],
-    tokenizer: AutoTokenizer,
+    qrels_by_domain: Dict[str, Dict[str, Dict[str, int]]],
+    tokenizer: Any,
     device: torch.device,
     use_amp: bool,
     max_query_len: int,
     max_doc_len: int,
-    eval_batch_size: int = 64,
+    eval_batch_size: int = 16,
     retrieval_depth: int = 1000,
 ) -> Dict[str, Any]:
-    """
-    Dense retrieval validation.
-
-    Per ogni dominio:
-        - encode corpus completo;
-        - encode validation queries;
-        - retrieve top-1000;
-        - calcola nDCG@10, Recall@K, MRR;
-        - calcola diagnostica per turno.
-
-    Importante:
-        la similarity matrix non viene mai materializzata interamente.
-        Le query vengono processate a blocchi.
-    """
-
+    """Dense validation a macro-media per dominio, con similarity a blocchi."""
     model.eval()
-
     per_domain: Dict[str, Dict[str, Any]] = {}
 
     for domain, samples in val_samples_by_domain.items():
         if not samples:
             continue
-
         corpus = corpus_by_domain[domain]
         qrels = qrels_by_domain.get(domain, {})
-
         doc_ids = list(corpus.keys())
-        doc_texts = [
-            corpus[doc_id]
-            for doc_id in doc_ids
-        ]
-
-        logger.info(
-            f"[VAL/{domain}] "
-            f"{len(samples)} queries | "
-            f"{len(doc_texts)} documents"
-        )
-
-        # ------------------------------------------------------------------
-        # 1. Encode corpus
-        # ------------------------------------------------------------------
+        doc_texts = [corpus[doc_id] for doc_id in doc_ids]
+        logger.info("[VAL/%s] %d queries | %d documents", domain, len(samples), len(doc_texts))
 
         corpus_chunks: List[torch.Tensor] = []
-
-        with torch.no_grad():
-            for start in range(
-                0,
-                len(doc_texts),
-                eval_batch_size,
-            ):
-                batch_texts = doc_texts[
-                    start:start + eval_batch_size
-                ]
-
-                encoded = tokenizer(
-                    batch_texts,
-                    padding=True,
-                    truncation=True,
-                    max_length=max_doc_len,
-                    return_tensors="pt",
+        for start in range(0, len(doc_texts), eval_batch_size):
+            encoded = tokenizer(
+                doc_texts[start:start + eval_batch_size],
+                padding=True,
+                truncation=True,
+                max_length=max_doc_len,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with autocast_context(device, use_amp):
+                embeddings = model.encode(
+                    input_ids=encoded["input_ids"],
+                    attention_mask=encoded["attention_mask"],
+                    token_type_ids=encoded.get("token_type_ids"),
                 )
+            corpus_chunks.append(embeddings.float().cpu())
+            del encoded, embeddings
 
-                encoded = {
-                    key: value.to(device)
-                    for key, value in encoded.items()
-                }
-
-                with autocast_context(
-                    device,
-                    use_amp,
-                ):
-                    embeddings = model.encode(
-                        encoded["input_ids"],
-                        encoded["attention_mask"],
-                        token_type_ids=encoded.get(
-                            "token_type_ids"
-                        ),
-                    )
-
-                corpus_chunks.append(
-                    embeddings.float().cpu()
-                )
-
-        corpus_embeddings = torch.cat(
-            corpus_chunks,
-            dim=0,
-        )
-
+        corpus_embeddings = torch.cat(corpus_chunks, dim=0)
         del corpus_chunks
         clear_device_cache(device)
 
-        # ------------------------------------------------------------------
-        # 2. Encode validation queries + retrieve
-        # ------------------------------------------------------------------
-
-        queries = [
-            sample.contextual_query
-            for sample in samples
-        ]
-
-        run: Dict[
-            str,
-            List[Tuple[str, float]],
-        ] = {}
-
-        with torch.no_grad():
-            for start in range(
-                0,
-                len(queries),
-                eval_batch_size,
-            ):
-                batch_samples = samples[
-                    start:start + eval_batch_size
+        run: Dict[str, List[Tuple[str, float]]] = {}
+        for start in range(0, len(samples), eval_batch_size):
+            batch_samples = samples[start:start + eval_batch_size]
+            batch_queries = [sample.contextual_query for sample in batch_samples]
+            encoded = tokenizer(
+                batch_queries,
+                padding=True,
+                truncation=True,
+                max_length=max_query_len,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with autocast_context(device, use_amp):
+                query_embeddings = model.encode(
+                    input_ids=encoded["input_ids"],
+                    attention_mask=encoded["attention_mask"],
+                    token_type_ids=encoded.get("token_type_ids"),
+                )
+            query_embeddings = query_embeddings.float().cpu()
+            scores = query_embeddings @ corpus_embeddings.T
+            k = min(int(retrieval_depth), len(doc_ids))
+            top_scores, top_indices = torch.topk(scores, k=k, dim=1)
+            for row, sample in enumerate(batch_samples):
+                run[sample.topic_id] = [
+                    (doc_ids[int(top_indices[row, col])], float(top_scores[row, col]))
+                    for col in range(k)
                 ]
-
-                batch_queries = [
-                    sample.contextual_query
-                    for sample in batch_samples
-                ]
-
-                encoded = tokenizer(
-                    batch_queries,
-                    padding=True,
-                    truncation=True,
-                    max_length=max_query_len,
-                    return_tensors="pt",
-                )
-
-                encoded = {
-                    key: value.to(device)
-                    for key, value in encoded.items()
-                }
-
-                with autocast_context(
-                    device,
-                    use_amp,
-                ):
-                    query_embeddings = model.encode(
-                        encoded["input_ids"],
-                        encoded["attention_mask"],
-                        token_type_ids=encoded.get(
-                            "token_type_ids"
-                        ),
-                    )
-
-                query_embeddings = (
-                    query_embeddings.float().cpu()
-                )
-
-                # Similarity solo per questo mini-batch.
-                scores = (
-                    query_embeddings
-                    @ corpus_embeddings.T
-                )
-
-                k = min(
-                    retrieval_depth,
-                    corpus_embeddings.shape[0],
-                )
-
-                top_scores, top_indices = torch.topk(
-                    scores,
-                    k=k,
-                    dim=1,
-                )
-
-                for row, sample in enumerate(
-                    batch_samples
-                ):
-                    ranking = []
-
-                    for col in range(k):
-                        doc_idx = int(
-                            top_indices[row, col]
-                        )
-
-                        ranking.append(
-                            (
-                                doc_ids[doc_idx],
-                                float(
-                                    top_scores[row, col]
-                                ),
-                            )
-                        )
-
-                    run[sample.topic_id] = ranking
-
-                del scores
-                del top_scores
-                del top_indices
-                del query_embeddings
+            del encoded, query_embeddings, scores, top_scores, top_indices
 
         del corpus_embeddings
         clear_device_cache(device)
 
-        # ------------------------------------------------------------------
-        # 3. Build official qrels intersection
-        # ------------------------------------------------------------------
-
-        valid_qrels: Dict[
-            str,
-            Dict[str, int],
-        ] = {}
-
         corpus_id_set = set(doc_ids)
-
+        valid_qrels: Dict[str, Dict[str, int]] = {}
         for sample in samples:
-            official_qrels = qrels.get(
-                sample.topic_id,
-                {},
-            )
-
             filtered = {
                 doc_id: int(rel)
-                for doc_id, rel in official_qrels.items()
-                if doc_id in corpus_id_set
-                and int(rel) > 0
+                for doc_id, rel in qrels.get(sample.topic_id, {}).items()
+                if doc_id in corpus_id_set and int(rel) > 0
             }
-
-            # Se il qrels non esiste, usiamo i gold del sample
-            # solo come fallback diagnostico.
+            # Fallback diagnostico soltanto: usa i gold disponibili nel sample.
             if not filtered:
-                filtered = {
-                    doc_id: 1
-                    for doc_id in sample.gold_doc_ids
-                    if doc_id in corpus_id_set
-                }
-
+                filtered = {doc_id: 1 for doc_id in sample.gold_doc_ids if doc_id in corpus_id_set}
             if filtered:
                 valid_qrels[sample.topic_id] = filtered
 
-        # ------------------------------------------------------------------
-        # 4. Metrics
-        # ------------------------------------------------------------------
+        trec_run = {topic: {doc_id: score for doc_id, score in ranking} for topic, ranking in run.items()}
+        official = compute_official_ndcg(valid_qrels, trec_run, cutoff=10)
 
-        trec_run = {
-            topic_id: {
-                doc_id: score
-                for doc_id, score in ranking
-            }
-            for topic_id, ranking in run.items()
-        }
-
-        official = compute_official_ndcg(
-            valid_qrels,
-            trec_run,
-            cutoff=10,
-        )
-
-        recalls = {
-            10: [],
-            50: [],
-            100: [],
-            500: [],
-            1000: [],
-        }
-
-        reciprocal_ranks = []
-
-        by_turn: Dict[str, List[float]] = (
-            collections.defaultdict(list)
-        )
-
-        for sample in samples:
-            topic_id = sample.topic_id
-
-            if topic_id not in valid_qrels:
-                continue
-
-            ranking = run.get(
-                topic_id,
-                [],
-            )
-
-            golds = set(
-                valid_qrels[topic_id].keys()
-            )
-
-            ranked_ids = [
-                doc_id
-                for doc_id, _score in ranking
-            ]
-
+        recalls: Dict[int, List[float]] = {10: [], 50: [], 100: [], 500: [], 1000: []}
+        reciprocal_ranks: List[float] = []
+        for topic_id, gold_map in valid_qrels.items():
+            ranked_ids = [doc_id for doc_id, _ in run.get(topic_id, [])]
+            golds = set(gold_map)
             for cutoff in recalls:
-                hits = len(
-                    set(
-                        ranked_ids[:cutoff]
-                    ).intersection(golds)
-                )
+                recalls[cutoff].append(len(set(ranked_ids[:cutoff]) & golds) / max(1, len(golds)))
+            reciprocal_ranks.append(next((1.0 / rank for rank, doc_id in enumerate(ranked_ids, start=1) if doc_id in golds), 0.0))
 
-                recalls[cutoff].append(
-                    hits / max(
-                        1,
-                        len(golds),
-                    )
-                )
-
-            rr = 0.0
-
-            for rank, doc_id in enumerate(
-                ranked_ids,
-                start=1,
-            ):
-                if doc_id in golds:
-                    rr = 1.0 / rank
-                    break
-
-            reciprocal_ranks.append(rr)
-
-            # Turn bucket
-            if sample.turn_id >= 5:
-                turn_key = "T5+"
-            else:
-                turn_key = f"T{sample.turn_id}"
-
-            # Single-query nDCG for diagnostics
-            single_qrel = {
-                topic_id: valid_qrels[topic_id]
-            }
-
-            single_run = {
-                topic_id: trec_run[topic_id]
-            }
-
-            single_ndcg = compute_official_ndcg(
-                single_qrel,
-                single_run,
-                cutoff=10,
-            ).get(
-                "ndcg_cut_10",
-                0.0,
-            )
-
-            by_turn[turn_key].append(
-                float(single_ndcg)
-            )
-
-        domain_result: Dict[str, Any] = {
+        result: Dict[str, Any] = {
             "num_topics": len(valid_qrels),
             "num_documents": len(doc_ids),
-            "nDCG@10": float(
-                official.get(
-                    "ndcg_cut_10",
-                    0.0,
-                )
-            ),
-            "Recall@10": float(
-                np.mean(recalls[10])
-                if recalls[10]
-                else 0.0
-            ),
-            "Recall@50": float(
-                np.mean(recalls[50])
-                if recalls[50]
-                else 0.0
-            ),
-            "Recall@100": float(
-                np.mean(recalls[100])
-                if recalls[100]
-                else 0.0
-            ),
-            "Recall@500": float(
-                np.mean(recalls[500])
-                if recalls[500]
-                else 0.0
-            ),
-            "Recall@1000": float(
-                np.mean(recalls[1000])
-                if recalls[1000]
-                else 0.0
-            ),
-            "MRR": float(
-                np.mean(reciprocal_ranks)
-                if reciprocal_ranks
-                else 0.0
-            ),
-            "nDCG@10_by_turn": {
-                turn: float(np.mean(values))
-                for turn, values
-                in sorted(by_turn.items())
-                if values
-            },
+            "nDCG@10": float(official.get("ndcg_cut_10", 0.0)),
+            "MRR": float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0,
         }
-
-        per_domain[domain] = domain_result
-
+        for cutoff, values in recalls.items():
+            result[f"Recall@{cutoff}"] = float(np.mean(values)) if values else 0.0
+        per_domain[domain] = result
         logger.info(
-            f"[VAL/{domain:<18}] "
-            f"nDCG@10={domain_result['nDCG@10']:.4f} | "
-            f"R@10={domain_result['Recall@10']:.4f} | "
-            f"R@100={domain_result['Recall@100']:.4f} | "
-            f"R@1000={domain_result['Recall@1000']:.4f} | "
-            f"MRR={domain_result['MRR']:.4f}"
+            "[VAL/%s] nDCG@10=%.4f | R@10=%.4f | R@100=%.4f | R@1000=%.4f | MRR=%.4f",
+            domain,
+            result["nDCG@10"],
+            result["Recall@10"],
+            result["Recall@100"],
+            result["Recall@1000"],
+            result["MRR"],
         )
-
-        if domain_result["nDCG@10_by_turn"]:
-            turn_string = " | ".join(
-                f"{turn}={score:.4f}"
-                for turn, score
-                in domain_result["nDCG@10_by_turn"].items()
-            )
-
-            logger.info(
-                f"[VAL/{domain:<18}] "
-                f"nDCG@10 by turn: {turn_string}"
-            )
-
-    # ----------------------------------------------------------------------
-    # Macro average over domains
-    # ----------------------------------------------------------------------
 
     if not per_domain:
-        return {
-            "per_domain": {},
-            "macro_average": {},
-        }
+        return {"per_domain": {}, "macro_average": {}}
 
-    metrics = [
-        "nDCG@10",
-        "Recall@10",
-        "Recall@50",
-        "Recall@100",
-        "Recall@500",
-        "Recall@1000",
-        "MRR",
-    ]
-
-    macro = {}
-
-    for metric in metrics:
-        values = [
-            result[metric]
-            for result in per_domain.values()
-        ]
-
-        macro[metric] = float(
-            np.mean(values)
-        )
-
-        macro[f"{metric}_std"] = float(
-            np.std(values)
-        )
-
-    return {
-        "per_domain": per_domain,
-        "macro_average": macro,
-    }
+    metric_names = ["nDCG@10", "Recall@10", "Recall@50", "Recall@100", "Recall@500", "Recall@1000", "MRR"]
+    macro: Dict[str, float] = {}
+    for name in metric_names:
+        values = [metrics[name] for metrics in per_domain.values()]
+        macro[name] = float(np.mean(values))
+        macro[f"{name}_std"] = float(np.std(values))
+    return {"per_domain": per_domain, "macro_average": macro}
 
 
 # =============================================================================
-# Training
+# Main training pipeline
 # =============================================================================
 
-def train_bi_encoder(
-    config: Dict[str, Any],
-) -> None:
+def train_bi_encoder(config: Dict[str, Any]) -> None:
+    general_cfg = config.get("general", {})
+    paths_cfg = config.get("paths", {})
+    domains_cfg = config.get("domains", {})
+    data_cfg = config.get("data", {})
+    rewrite_cfg = config.get("query_rewriting", {})
+    bi_cfg = config.get("bi_encoder", {})
+    training_cfg = config.get("training", {})
+    lora_cfg = config.get("lora", {})
+    evaluation_cfg = config.get("evaluation", {})
 
-    # ------------------------------------------------------------------
-    # Configuration
-    # ------------------------------------------------------------------
-
-    general_cfg = config.get(
-        "general",
-        {},
-    )
-
-    paths_cfg = config.get(
-        "paths",
-        {},
-    )
-
-    domains_cfg = config.get(
-        "domains",
-        {},
-    )
-
-    data_cfg = config.get(
-        "data",
-        {},
-    )
-
-    bi_cfg = config.get(
-        "bi_encoder",
-        {},
-    )
-
-    training_cfg = config.get(
-        "training",
-        {},
-    )
-
-    lora_cfg = config.get(
-        "lora",
-        {},
-    )
-
-    evaluation_cfg = config.get(
-        "evaluation",
-        {},
-    )
-
-    seed = int(
-        general_cfg.get(
-            "seed",
-            42,
-        )
-    )
-
+    seed = int(general_cfg.get("seed", 42))
     set_seed(seed)
+    device = resolve_device(general_cfg.get("device", "auto"))
+    use_amp = bool(general_cfg.get("mixed_precision", True) and device.type == "cuda")
 
-    device = resolve_device(
-        general_cfg.get(
-            "device",
-            "auto",
-        )
-    )
+    logger.info("=" * 88)
+    logger.info("RETECO SUB-TRACK 2a — QUERY REASONING + QWEN3 EMBEDDING")
+    logger.info("Device=%s | AMP FP16=%s | seed=%d", device, use_amp, seed)
 
-    use_amp = bool(
-        general_cfg.get(
-            "mixed_precision",
-            True,
-        )
-        and device.type == "cuda"
-    )
+    requested_domains = domains_cfg.get("active_domains", "all")
+    domains = list(TRACK2_DOMAINS) if requested_domains == "all" else list(requested_domains)
+    unknown_domains = [domain for domain in domains if domain not in TRACK2_DOMAINS]
+    if not domains or unknown_domains:
+        raise ValueError(f"active_domains non valido: {domains}; domini sconosciuti={unknown_domains}")
+    logger.info("Domains (%d): %s", len(domains), ", ".join(domains))
 
-    logger.info(
-        "=" * 90
-    )
-    logger.info(
-        "RETECO SUB-TRACK 2a"
-    )
-    logger.info(
-        "Bi-Encoder Training"
-    )
-    logger.info(
-        "=" * 90
-    )
-    logger.info(
-        f"Device        : {device}"
-    )
-    logger.info(
-        f"AMP FP16      : {use_amp}"
-    )
-    logger.info(
-        f"Seed          : {seed}"
-    )
+    data_mode = str(paths_cfg.get("data_mode", "full")).lower().strip()
+    if data_mode not in {"full", "sample"}:
+        raise ValueError("paths.data_mode deve essere 'full' oppure 'sample'.")
+    base_data_dir_value = paths_cfg.get("full_data_dir" if data_mode == "full" else "sample_data_dir")
+    if not base_data_dir_value:
+        raise ValueError(f"Manca paths.{ 'full_data_dir' if data_mode == 'full' else 'sample_data_dir' } nel config.")
+    base_data_dir = Path(base_data_dir_value)
 
-    # ------------------------------------------------------------------
-    # Domains
-    # ------------------------------------------------------------------
+    checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2a/qwen3_embedding_0.6b_reasoning"))
+    output_dir = Path(paths_cfg.get("output_dir", "outputs/subtrack_2a/qwen3_embedding_0.6b_reasoning"))
+    hard_negative_cache_dir = Path(paths_cfg.get("hard_negatives_cache_dir", "data/cache/hard_negatives"))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    requested_domains = domains_cfg.get(
-        "active_domains",
-        "all",
-    )
-
-    if requested_domains == "all":
-        domains = list(TRACK2_DOMAINS)
-    else:
-        domains = list(requested_domains)
-
-    unknown_domains = [
-        domain
-        for domain in domains
-        if domain not in TRACK2_DOMAINS
-    ]
-
-    if unknown_domains:
-        raise ValueError(
-            f"Domini non validi: {unknown_domains}"
-        )
-
-    logger.info(
-        f"Domains       : {', '.join(domains)}"
-    )
-
-    # ------------------------------------------------------------------
-    # Paths
-    # ------------------------------------------------------------------
-
-    data_mode = paths_cfg.get(
-        "data_mode",
-        "full",
-    )
-
-    if data_mode == "full":
-        base_data_dir = Path(
-            paths_cfg.get(
-                "full_data_dir"
-            )
-        )
-    else:
-        base_data_dir = Path(
-            paths_cfg.get(
-                "sample_data_dir"
-            )
-        )
-
-    checkpoint_dir = Path(
-        paths_cfg.get(
-            "checkpoint_dir",
-            "checkpoints/subtrack_2a/bi_encoder",
-        )
-    )
-
-    output_dir = Path(
-        paths_cfg.get(
-            "output_dir",
-            "outputs/subtrack_2a",
-        )
-    )
-
-    checkpoint_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    hard_negative_cache_dir = Path(
-        paths_cfg.get(
-            "hard_negatives_cache_dir",
-            "data/cache/hard_negatives",
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # Tokenizer
-    # ------------------------------------------------------------------
-
-    model_name = bi_cfg.get(
-        "model_name_or_path",
-        "BAAI/bge-base-en-v1.5",
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name
-    )
-
+    model_name = str(bi_cfg.get("model_name_or_path", "Qwen/Qwen3-Embedding-0.6B"))
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
         else:
-            tokenizer.add_special_tokens(
-                {"pad_token": "[PAD]"}
-            )
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-    query_instruction_cfg = bi_cfg.get(
-        "query_instruction",
-        {},
-    )
+    max_query_length = int(data_cfg.get("max_query_length", 512))
+    max_doc_length = int(data_cfg.get("max_doc_length", 384))
+    query_strategy = str(data_cfg.get("query_strategy", "history"))
+    query_mode = str(data_cfg.get("query_mode", "alternate")).lower().strip()
+    if query_mode not in RETECO2aTrainDataset.VALID_QUERY_MODES:
+        raise ValueError(f"data.query_mode deve essere una tra {sorted(RETECO2aTrainDataset.VALID_QUERY_MODES)}")
 
+    instruction_cfg = bi_cfg.get("query_instruction", {})
     query_instruction = (
-        query_instruction_cfg.get(
-            "text",
-            "",
-        )
-        if query_instruction_cfg.get(
-            "enabled",
-            False,
-        )
+        str(instruction_cfg.get("text", "")).strip()
+        if bool(instruction_cfg.get("enabled", False))
         else ""
     )
+    if "Qwen3-Embedding" in model_name and not query_instruction:
+        raise ValueError("Qwen3-Embedding richiede bi_encoder.query_instruction.enabled=true e un'istruzione non vuota.")
 
-    max_query_length = int(
-        data_cfg.get(
-            "max_query_length",
-            256,
-        )
+    # Il formatter raw è intenzionalmente senza prefisso Qwen: viene usato da BM25.
+    raw_formatter = ContextAwareQueryFormatter(
+        tokenizer=tokenizer,
+        max_query_length=max_query_length,
+        query_instruction="",
+        strategy=query_strategy,
     )
-
-    max_doc_length = int(
-        data_cfg.get(
-            "max_doc_length",
-            256,
-        )
-    )
-
-    query_strategy = data_cfg.get(
-        "query_strategy",
-        "history",
-    )
-
-    formatter = ContextAwareQueryFormatter(
+    # Questo formatter prepara gli input del dense encoder.
+    encoder_formatter = ContextAwareQueryFormatter(
         tokenizer=tokenizer,
         max_query_length=max_query_length,
         query_instruction=query_instruction,
         strategy=query_strategy,
     )
 
-    logger.info(
-        f"Query strategy        : {query_strategy}"
-    )
-    logger.info(
-        f"Max query tokens      : {max_query_length}"
-    )
-    logger.info(
-        f"Max document tokens   : {max_doc_length}"
-    )
+    val_ratio = float(data_cfg.get("val_ratio", 0.15))
+    train_samples_by_domain: Dict[str, List[ConversationalTurnSample]] = {}
+    val_samples_by_domain: Dict[str, List[ConversationalTurnSample]] = {}
+    corpus_by_domain: Dict[str, Dict[str, str]] = {}
+    val_qrels_by_domain: Dict[str, Dict[str, Dict[str, int]]] = {}
 
-    # ------------------------------------------------------------------
-    # Load data
-    # ------------------------------------------------------------------
-
-    internal_val_ratio = float(
-        data_cfg.get(
-            "val_ratio",
-            0.15,
-        )
-    )
-
-    train_samples_by_domain: Dict[
-        str,
-        List[ConversationalTurnSample],
-    ] = {}
-
-    val_samples_by_domain: Dict[
-        str,
-        List[ConversationalTurnSample],
-    ] = {}
-
-    corpus_by_domain: Dict[
-        str,
-        Dict[str, str],
-    ] = {}
-
-    train_qrels_by_domain: Dict[
-        str,
-        Dict[str, Dict[str, int]],
-    ] = {}
-
-    val_qrels_by_domain: Dict[
-        str,
-        Dict[str, Dict[str, int]],
-    ] = {}
-
-    domain_datasets: Dict[
-        str,
-        RETECO2aTrainDataset,
-    ] = {}
-
-    hard_negative_maps: Dict[
-        str,
-        Dict[str, List[str]],
-    ] = {}
-
-    logger.info(
-        "Loading datasets..."
-    )
-
+    logger.info("Loading official RETECO training split from %s", base_data_dir)
     for domain in domains:
-
-        corpus, samples, qrels = (
-            load_track2_domain_data(
-                data_dir=base_data_dir,
-                domain=domain,
-                split="train",
-                formatter=formatter,
-            )
+        corpus, samples, qrels = load_track2_domain_data(
+            data_dir=base_data_dir,
+            domain=domain,
+            split="train",
+            formatter=raw_formatter,
         )
-
-        train_samples, val_samples = (
-            split_conversations_train_val(
-                samples=samples,
-                val_ratio=internal_val_ratio,
-                seed=seed,
-            )
+        train_samples, val_samples = split_conversations_train_val(
+            samples=samples,
+            val_ratio=val_ratio,
+            seed=seed,
         )
-
+        if not train_samples or not val_samples:
+            raise ValueError(
+                f"Split interno vuoto per {domain}: train={len(train_samples)}, val={len(val_samples)}. "
+                "Usare più conversazioni o ridurre data.val_ratio."
+            )
         corpus_by_domain[domain] = corpus
         train_samples_by_domain[domain] = train_samples
         val_samples_by_domain[domain] = val_samples
-
-        train_qrels_by_domain[domain] = qrels
-
-        # Il qrels del train viene ricostruito perché la validation interna
-        # utilizzerà solo i topic appartenenti alla sua porzione.
-        val_topic_ids = {
-            sample.topic_id
-            for sample in val_samples
-        }
-
+        val_topic_ids = {sample.topic_id for sample in val_samples}
         val_qrels_by_domain[domain] = {
             topic_id: qrels[topic_id]
             for topic_id in val_topic_ids
             if topic_id in qrels
         }
-
         logger.info(
-            f"[{domain:<18}] "
-            f"corpus={len(corpus):>7} | "
-            f"turns={len(samples):>4} | "
-            f"train={len(train_samples):>4} | "
-            f"val={len(val_samples):>4}"
+            "[%s] corpus=%d | turns=%d | train=%d | internal-val=%d | conversations=%d",
+            domain,
+            len(corpus),
+            len(samples),
+            len(train_samples),
+            len(val_samples),
+            len({sample.conversation_id for sample in samples}),
         )
 
-        # --------------------------------------------------------------
-        # Hard negatives SOLO sul training split interno.
-        # --------------------------------------------------------------
-
-        hard_neg_top_k = int(
-            data_cfg.get(
-                "hard_negative_pool_size",
-                50,
-            )
+    # ----------------------------------------------------------------------
+    # Query rewriting cache (only train portion; query rewriting never sees qrels)
+    # ----------------------------------------------------------------------
+    rewrites_by_domain: Dict[str, Dict[str, str]] = {}
+    if query_mode in {"reasoned", "alternate"}:
+        if not bool(rewrite_cfg.get("enabled", True)):
+            raise ValueError("data.query_mode richiede query_rewriting.enabled=true.")
+        rewrites_by_domain = prepare_query_rewrites(
+            domains=domains,
+            train_samples_by_domain=train_samples_by_domain,
+            formatter=raw_formatter,
+            paths_cfg=paths_cfg,
+            rewrite_cfg=rewrite_cfg,
+            seed=seed,
+            val_ratio=val_ratio,
         )
+    else:
+        logger.info("query_mode=contextual: query rewriting cache non richiesta per training.")
+
+    # ----------------------------------------------------------------------
+    # Mine BM25 hard negatives before adding the dense encoder instruction.
+    # ----------------------------------------------------------------------
+    domain_datasets: Dict[str, RETECO2aTrainDataset] = {}
+    hard_negative_maps: Dict[str, Dict[str, List[str]]] = {}
+    hard_neg_top_k = int(data_cfg.get("hard_negative_pool_size", 40))
+    sparse_cfg = config.get("sparse", {})
+
+    logger.info("Mining/loading BM25 hard negatives (unprefixed conversational queries)...")
+    for domain in domains:
+        corpus = corpus_by_domain[domain]
+        train_samples = train_samples_by_domain[domain]
 
         hard_negatives = mine_bm25_hard_negatives(
             corpus=corpus,
             samples=train_samples,
             top_k=hard_neg_top_k,
-            k1=float(
-                config.get(
-                    "sparse",
-                    {},
-                ).get(
-                    "k1",
-                    0.9,
-                )
-            ),
-            b=float(
-                config.get(
-                    "sparse",
-                    {},
-                ).get(
-                    "b",
-                    0.4,
-                )
-            ),
+            k1=float(sparse_cfg.get("k1", 0.9)),
+            b=float(sparse_cfg.get("b", 0.4)),
             cache_dir=hard_negative_cache_dir,
             cache_tag=(
-                f"{domain}_train_"
-                f"{query_strategy}_"
-                f"{max_query_length}"
+                f"{safe_component(domain)}_train_raw_context_v1_"
+                f"{query_strategy}_{max_query_length}_top{hard_neg_top_k}"
             ),
         )
-
         hard_negative_maps[domain] = hard_negatives
 
-        domain_dataset = RETECO2aTrainDataset(
+        # Apply Qwen's query instruction only after BM25 mining.
+        for sample in train_samples + val_samples_by_domain[domain]:
+            sample.contextual_query = encoder_formatter.format(
+                query=sample.query,
+                history=sample.history,
+            )
+
+        if query_mode in {"reasoned", "alternate"}:
+            rewrite_map = rewrites_by_domain[domain]
+            for sample in train_samples:
+                raw_rewrite = rewrite_map.get(sample.topic_id, "")
+                sample.reasoned_query = encoder_formatter.format_rewritten(raw_rewrite) if raw_rewrite else ""
+
+        dataset = RETECO2aTrainDataset(
             samples=train_samples,
             corpus=corpus,
-            negatives_per_positive=int(
-                data_cfg.get(
-                    "negatives_per_positive",
-                    4,
-                )
-            ),
+            negatives_per_positive=int(data_cfg.get("negatives_per_positive", 2)),
             hard_negatives=hard_negatives,
-            sampling_strategy=data_cfg.get(
-                "negative_sampling_strategy",
-                "bm25_hard",
-            ),
+            sampling_strategy=str(data_cfg.get("negative_sampling_strategy", "bm25_hard")),
             seed=seed,
+            query_mode=query_mode,
+            require_reasoned_queries=bool(data_cfg.get("require_reasoned_queries", True)) if query_mode != "contextual" else False,
         )
+        domain_datasets[domain] = dataset
+        logger.info("[DATASET/%s] %s", domain, dataset.get_diagnostics())
 
-        domain_datasets[domain] = domain_dataset
-
-    # ------------------------------------------------------------------
-    # Dataset diagnostics
-    # ------------------------------------------------------------------
-
-    dataset_report = summarize_training_datasets(
-        domain_datasets=domain_datasets,
-        hard_negative_maps=hard_negative_maps,
-    )
-
-    logger.info(
-        "=" * 90
-    )
-    logger.info(
-        "TRAIN DATASET DIAGNOSTICS"
-    )
-    logger.info(
-        "=" * 90
-    )
-
-    for domain, stats in dataset_report[
-        "domains"
-    ].items():
-
-        logger.info(
-            f"{domain:<18} | "
-            f"samples={stats['num_samples']:>4} | "
-            f"convs={stats['num_unique_conversations']:>3} | "
-            f"gold/turn={stats['avg_gold_per_sample']:.2f} | "
-            f"hardNeg avg={stats['avg_mined_hard_negatives']:.2f} | "
-            f"hardNeg min={stats['min_mined_hard_negatives']:>2} | "
-            f"insufficient={stats['samples_below_requested_negative_count']}"
-        )
-
-    # ------------------------------------------------------------------
-    # ConcatDataset
-    # ------------------------------------------------------------------
-
-    concat_train_dataset = ConcatDataset(
-        list(
-            domain_datasets.values()
-        )
-    )
-
-    sampler_samples: List[
-        ConversationalTurnSample
-    ] = []
-
+    # ----------------------------------------------------------------------
+    # Combined dataset and loader
+    # ----------------------------------------------------------------------
+    concat_train_dataset = ConcatDataset([domain_datasets[domain] for domain in domains])
+    sampler_samples: List[ConversationalTurnSample] = []
     for domain in domains:
-        sampler_samples.extend(
-            domain_datasets[
-                domain
-            ].valid_samples
-        )
+        sampler_samples.extend(domain_datasets[domain].valid_samples)
 
-    batch_size = int(
-        training_cfg.get(
-            "batch_size",
-            4,
-        )
-    )
-
-    domain_balanced = bool(
-        domains_cfg.get(
-            "domain_balanced_training",
-            True,
-        )
-    )
+    batch_size = int(training_cfg.get("batch_size", 4))
+    if batch_size <= 0:
+        raise ValueError("training.batch_size deve essere > 0.")
+    gradient_accumulation_steps = int(training_cfg.get("gradient_accumulation_steps", 1))
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("training.gradient_accumulation_steps deve essere > 0.")
 
     collate_fn = ConversationalCollateFn(
         tokenizer=tokenizer,
         max_query_len=max_query_length,
         max_doc_len=max_doc_length,
     )
-
-    num_workers = int(
-        data_cfg.get(
-            "num_workers",
-            0,
-        )
-    )
-
-    pin_memory = bool(
-        data_cfg.get(
-            "pin_memory",
-            True,
-        )
-        and device.type == "cuda"
-    )
+    num_workers = int(data_cfg.get("num_workers", 0))
+    pin_memory = bool(data_cfg.get("pin_memory", True) and device.type == "cuda")
+    domain_balanced = bool(domains_cfg.get("domain_balanced_training", True))
+    batch_sampler = None
 
     if domain_balanced:
-
         batch_sampler = DomainBalancedBatchSampler(
             samples=sampler_samples,
             batch_size=batch_size,
             seed=seed,
         )
-
         train_loader = DataLoader(
             concat_train_dataset,
             batch_sampler=batch_sampler,
@@ -1256,9 +627,7 @@ def train_bi_encoder(
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
-
     else:
-
         train_loader = DataLoader(
             concat_train_dataset,
             batch_size=batch_size,
@@ -1266,1390 +635,378 @@ def train_bi_encoder(
             collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            drop_last=True,
+            drop_last=False,
         )
 
-    logger.info(
-        f"Train samples       : {len(concat_train_dataset)}"
-    )
+    if len(train_loader) == 0:
+        raise ValueError("Il DataLoader non contiene batch. Ridurre batch_size o controllare il dataset.")
 
-    logger.info(
-        f"Batch size          : {batch_size}"
-    )
+    dataset_report = summarize_training_datasets(domain_datasets, hard_negative_maps)
+    logger.info("Total train samples=%d | batches/epoch=%d | batch_size=%d | grad_accum=%d", len(concat_train_dataset), len(train_loader), batch_size, gradient_accumulation_steps)
+    logger.info("Domain-balanced batches=%s | negatives/query=%d | query_mode=%s", domain_balanced, int(data_cfg.get("negatives_per_positive", 2)), query_mode)
+    logger.info("Raw formatter diagnostics: %s", raw_formatter.get_diagnostics())
+    logger.info("Encoder formatter diagnostics: %s", encoder_formatter.get_diagnostics())
 
-    logger.info(
-        f"Gradient accumulation: "
-        f"{training_cfg.get('gradient_accumulation_steps', 1)}"
-    )
-
-    logger.info(
-        f"Domain-balanced    : {domain_balanced}"
-    )
-
-    # Diagnostica negative.
-    requested_k = int(
-        data_cfg.get(
-            "negatives_per_positive",
-            4,
-        )
-    )
-
-    logger.info(
-        f"Explicit negatives/query : {requested_k}"
-    )
-
-    logger.info(
-        f"In-batch negatives/query  : "
-        f"{max(0, batch_size - 1)}"
-    )
-
-    logger.info(
-        f"Contrastive candidates/query: "
-        f"{1 + requested_k + max(0, batch_size - 1)} "
-        f"(positive + explicit + in-batch)"
-    )
-
-    # ------------------------------------------------------------------
-    # Formatter diagnostics
-    # ------------------------------------------------------------------
-
-    formatter_diag = formatter.get_diagnostics()
-
-    logger.info(
-        "=" * 90
-    )
-    logger.info(
-        "QUERY FORMATTER DIAGNOSTICS"
-    )
-    logger.info(
-        "=" * 90
-    )
-
-    for key, value in formatter_diag.items():
-
-        if key.startswith("pct_"):
-            logger.info(
-                f"{key:<30}: {value:.2f}%"
-            )
-        else:
-            logger.info(
-                f"{key:<30}: {value:.2f}"
-            )
-
-    # ------------------------------------------------------------------
-    # Model
-    # ------------------------------------------------------------------
-
-    gradient_checkpointing = bool(
-        bi_cfg.get(
-            "gradient_checkpointing",
-            False,
-        )
-    )
-
+    # ----------------------------------------------------------------------
+    # Load dense encoder only after the query generator has been released.
+    # ----------------------------------------------------------------------
+    gradient_checkpointing = bool(bi_cfg.get("gradient_checkpointing", True))
     model = ConversationalBiEncoder(
         model_name_or_path=model_name,
-        temperature=float(
-            bi_cfg.get(
-                "temperature",
-                0.05,
-            )
-        ),
-        normalize_embeddings=bool(
-            bi_cfg.get(
-                "normalize_embeddings",
-                True,
-            )
-        ),
-        pooling_strategy=bi_cfg.get(
-            "pooling_strategy",
-            "cls",
-        ),
+        temperature=float(bi_cfg.get("temperature", 0.05)),
+        normalize_embeddings=bool(bi_cfg.get("normalize_embeddings", True)),
+        pooling_strategy=str(bi_cfg.get("pooling_strategy", "last_token")),
         lora_cfg=lora_cfg,
         gradient_checkpointing=gradient_checkpointing,
-        negative_chunk_size=int(
-            training_cfg.get(
-                "negative_chunk_size",
-                8,
-            )
-        ),
+        negative_chunk_size=int(training_cfg.get("negative_chunk_size", 8)),
     ).to(device)
 
-    parameter_stats = count_parameters(
-        model
-    )
-
+    parameter_stats = count_parameters(model)
     logger.info(
-        "=" * 90
+        "Model=%s | pooling=%s | temperature=%.4f | LoRA=%s | gradient_checkpointing=%s",
+        model_name,
+        getattr(model, "pooling_strategy", bi_cfg.get("pooling_strategy", "last_token")),
+        float(bi_cfg.get("temperature", 0.05)),
+        bool(lora_cfg.get("enabled", False)),
+        gradient_checkpointing,
     )
-    logger.info(
-        "MODEL"
-    )
-    logger.info(
-        "=" * 90
-    )
-    logger.info(
-        f"Model                : {model_name}"
-    )
-    logger.info(
-        f"Pooling              : "
-        f"{bi_cfg.get('pooling_strategy', 'cls')}"
-    )
-    logger.info(
-        f"Temperature           : "
-        f"{bi_cfg.get('temperature', 0.05)}"
-    )
-    logger.info(
-        f"LoRA enabled          : "
-        f"{bool(lora_cfg.get('enabled', False))}"
-    )
-    logger.info(
-        f"Gradient checkpoint   : "
-        f"{gradient_checkpointing}"
-    )
-    logger.info(
-        f"Total parameters      : "
-        f"{parameter_stats['total']:,}"
-    )
-    logger.info(
-        f"Trainable parameters  : "
-        f"{parameter_stats['trainable']:,}"
-    )
-    logger.info(
-        f"Frozen parameters     : "
-        f"{parameter_stats['frozen']:,}"
-    )
+    logger.info("Parameters: total=%s | trainable=%s | frozen=%s", f"{parameter_stats['total']:,}", f"{parameter_stats['trainable']:,}", f"{parameter_stats['frozen']:,}")
+    if parameter_stats["trainable"] == 0:
+        raise RuntimeError("Il modello non ha parametri trainabili. Controllare la configurazione LoRA.")
 
-    # ------------------------------------------------------------------
-    # Optimizer / scheduler
-    # ------------------------------------------------------------------
-
-    epochs = int(
-        training_cfg.get(
-            "epochs",
-            3,
-        )
-    )
-
-    gradient_accumulation_steps = int(
-        training_cfg.get(
-            "gradient_accumulation_steps",
-            1,
-        )
-    )
-
-    updates_per_epoch = math.ceil(
-        len(train_loader)
-        / gradient_accumulation_steps
-    )
-
-    total_optimizer_steps = (
-        updates_per_epoch * epochs
-    )
-
-    learning_rate = float(
-        training_cfg.get(
-            "learning_rate",
-            1e-4,
-        )
-    )
-
-    weight_decay = float(
-        training_cfg.get(
-            "weight_decay",
-            0.01,
-        )
-    )
-
-    warmup_ratio = float(
-        training_cfg.get(
-            "warmup_ratio",
-            0.1,
-        )
-    )
-
-    warmup_steps = int(
-        total_optimizer_steps
-        * warmup_ratio
-    )
-
-    trainable_parameters = [
-        p
-        for p in model.parameters()
-        if p.requires_grad
-    ]
-
-    optimizer = torch.optim.AdamW(
-        trainable_parameters,
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
-
+    # ----------------------------------------------------------------------
+    # Optimizer/scheduler
+    # ----------------------------------------------------------------------
+    epochs = int(training_cfg.get("epochs", 2))
+    if epochs <= 0:
+        raise ValueError("training.epochs deve essere > 0.")
+    updates_per_epoch = math.ceil(len(train_loader) / gradient_accumulation_steps)
+    total_optimizer_steps = updates_per_epoch * epochs
+    learning_rate = float(training_cfg.get("learning_rate", 3e-5))
+    weight_decay = float(training_cfg.get("weight_decay", 0.01))
+    warmup_ratio = float(training_cfg.get("warmup_ratio", 0.06))
+    warmup_steps = int(total_optimizer_steps * warmup_ratio)
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=learning_rate, weight_decay=weight_decay)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_optimizer_steps,
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=True) if use_amp else None
+    max_grad_norm = float(training_cfg.get("max_grad_norm", 1.0))
+    log_every = max(1, int(training_cfg.get("log_every_n_steps", 20)))
+    patience = max(1, int(training_cfg.get("early_stopping_patience", 1)))
 
-    scaler = None
-
-    if use_amp:
-        scaler = torch.amp.GradScaler(
-            "cuda",
-            enabled=True,
-        )
-
-    max_grad_norm = float(
-        training_cfg.get(
-            "max_grad_norm",
-            1.0,
-        )
-    )
-
-    logger.info(
-        "=" * 90
-    )
-    logger.info(
-        "OPTIMIZATION"
-    )
-    logger.info(
-        "=" * 90
-    )
-    logger.info(
-        f"Epochs               : {epochs}"
-    )
-    logger.info(
-        f"Batches/epoch        : {len(train_loader)}"
-    )
-    logger.info(
-        f"Optimizer updates    : {total_optimizer_steps}"
-    )
-    logger.info(
-        f"LR                   : {learning_rate:.2e}"
-    )
-    logger.info(
-        f"Weight decay         : {weight_decay:.4f}"
-    )
-    logger.info(
-        f"Warmup steps         : {warmup_steps}"
-    )
-    logger.info(
-        f"Grad clip            : {max_grad_norm:.2f}"
-    )
-
-    # ------------------------------------------------------------------
-    # Model selection
-    # ------------------------------------------------------------------
-
-    monitor_metric = training_cfg.get(
-        "monitor_metric",
-        "val_ndcg@10",
-    )
+    logger.info("Epochs=%d | optimizer updates=%d | LR=%.2e | warmup=%d", epochs, total_optimizer_steps, learning_rate, warmup_steps)
 
     best_score = -float("inf")
-    best_epoch = -1
-
-    patience = int(
-        training_cfg.get(
-            "early_stopping_patience",
-            2,
-        )
-    )
-
+    best_epoch = 0
     epochs_without_improvement = 0
-
-    # ------------------------------------------------------------------
-    # History
-    # ------------------------------------------------------------------
-
-    training_history: List[
-        Dict[str, Any]
-    ] = []
-
     global_step = 0
     optimizer_step = 0
+    training_history: List[Dict[str, Any]] = []
 
-    # =========================================================================
+    # ----------------------------------------------------------------------
     # Epoch loop
-    # =========================================================================
-
+    # ----------------------------------------------------------------------
     for epoch in range(epochs):
-
-        logger.info(
-            "\n"
-            + "=" * 90
-        )
-        logger.info(
-            f"EPOCH {epoch + 1}/{epochs}"
-        )
-        logger.info(
-            "=" * 90
-        )
-
-        # Nuovo shuffle deterministico.
-        for domain_dataset in domain_datasets.values():
-            domain_dataset.set_epoch(epoch)
-
-        if domain_balanced:
+        logger.info("\n%s\nEPOCH %d/%d\n%s", "=" * 82, epoch + 1, epochs, "=" * 82)
+        for dataset in domain_datasets.values():
+            dataset.set_epoch(epoch)
+        if batch_sampler is not None:
             batch_sampler.set_epoch(epoch)
 
         model.train()
-
         epoch_start = time.time()
-
-        running_loss = 0.0
-        running_loss_sq = 0.0
-
-        running_rank1 = 0.0
-        running_pos_logit = 0.0
-        running_max_neg_logit = 0.0
-        running_margin = 0.0
-
-        running_grad_norm_sum = 0.0
-        running_grad_norm_max = 0.0
-
-        running_positive_cosine = 0.0
-        running_hard_negative_cosine = 0.0
-        running_in_batch_negative_cosine = 0.0
-        running_hard_negative_margin = 0.0
-        running_in_batch_margin = 0.0
-
-        domain_loss_sum = collections.defaultdict(float)
-        domain_batch_count = collections.defaultdict(int)
-
-        batches_with_multiple_domains = 0
+        loss_values: List[float] = []
+        rank1_values: List[float] = []
+        margin_values: List[float] = []
+        pos_cos_values: List[float] = []
+        hard_cos_values: List[float] = []
+        inbatch_cos_values: List[float] = []
+        grad_norm_values: List[float] = []
+        domain_loss: Dict[str, List[float]] = collections.defaultdict(list)
         non_finite_batches = 0
+        optimizer.zero_grad(set_to_none=True)
 
-        total_examples = 0
-
-        lr_values: List[float] = []
-
-        optimizer.zero_grad(
-            set_to_none=True
-        )
-
-        progress = tqdm(
-            enumerate(train_loader),
-            total=len(train_loader),
-            desc=f"Epoch {epoch + 1}/{epochs}",
-        )
-
+        progress = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{epochs}")
         for batch_idx, batch in progress:
+            q_inputs = {key: value.to(device, non_blocking=pin_memory) for key, value in batch["query_inputs"].items()}
+            pos_inputs = {key: value.to(device, non_blocking=pin_memory) for key, value in batch["pos_inputs"].items()}
+            neg_inputs = {key: value.to(device, non_blocking=pin_memory) for key, value in batch["neg_inputs"].items()}
+            current_k_negs = int(batch["k_negs"])
 
-            batch_start = time.time()
-
-            batch_domains = batch.get(
-                "domains",
-                [],
-            )
-
-            unique_domains = set(
-                batch_domains
-            )
-
-            if len(unique_domains) > 1:
-                batches_with_multiple_domains += 1
-
-            q_inputs = {
-                key: value.to(device)
-                for key, value
-                in batch["query_inputs"].items()
-            }
-
-            pos_inputs = {
-                key: value.to(device)
-                for key, value
-                in batch["pos_inputs"].items()
-            }
-
-            neg_inputs = {
-                key: value.to(device)
-                for key, value
-                in batch["neg_inputs"].items()
-            }
-
-            current_k_negs = int(
-                batch["k_negs"]
-            )
-
-            with autocast_context(
-                device,
-                use_amp,
-            ):
-
+            with autocast_context(device, use_amp):
                 output = model(
                     query_inputs=q_inputs,
                     pos_inputs=pos_inputs,
                     neg_inputs=neg_inputs,
                     k_negs=current_k_negs,
                 )
-
                 raw_loss = output["loss"]
-                loss = (
-                    raw_loss
-                    / gradient_accumulation_steps
-                )
+                scaled_loss = raw_loss / gradient_accumulation_steps
 
-            if not torch.isfinite(
-                raw_loss
-            ).item():
-
+            if not torch.isfinite(raw_loss).item():
                 non_finite_batches += 1
-
-                logger.error(
-                    f"Non-finite loss at "
-                    f"epoch={epoch + 1}, "
-                    f"batch={batch_idx + 1}: "
-                    f"{raw_loss.item()}"
-                )
-
                 raise FloatingPointError(
-                    "Training interrotto per loss "
-                    "non-finite."
+                    f"Loss non-finite a epoch={epoch + 1}, batch={batch_idx + 1}: {raw_loss.item()}"
                 )
-
-            # -------------------------------------------------------------
-            # Backward
-            # -------------------------------------------------------------
 
             if scaler is not None:
-                scaler.scale(
-                    loss
-                ).backward()
+                scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
-
-            # -------------------------------------------------------------
-            # Diagnostics dei logits
-            # -------------------------------------------------------------
+                scaled_loss.backward()
 
             with torch.no_grad():
-
-                logits = output["logits"].detach()
-
+                logits = output["logits"].detach().float()
                 positive_logits = logits[:, 0]
-
                 if logits.shape[1] > 1:
-
-                    negative_logits = logits[:, 1:]
-
-                    max_negative = (
-                        negative_logits.max(
-                            dim=1
-                        ).values
-                    )
-
-                    margin = (
-                        positive_logits
-                        - max_negative
-                    )
-
-                    rank1 = (
-                        logits.argmax(
-                            dim=1
-                        ) == 0
-                    ).float().mean()
-
+                    max_negative = logits[:, 1:].max(dim=1).values
+                    margin = positive_logits - max_negative
+                    rank1 = (logits.argmax(dim=1) == 0).float().mean()
                 else:
-
-                    max_negative = torch.zeros_like(
-                        positive_logits
-                    )
-
+                    max_negative = torch.zeros_like(positive_logits)
                     margin = positive_logits
-
-                    rank1 = torch.ones_like(
-                        positive_logits
-                    ).mean()
-
-                # ----------------------------------------------------------
-                # Nuove diagnostiche in cosine space
-                # ----------------------------------------------------------
-
-                positive_cosine = float(
-                    output["positive_cosine"]
-                    .detach()
-                    .item()
-                )
-
-                hard_negative_cosine = float(
-                    output["hard_negative_cosine"]
-                    .detach()
-                    .item()
-                )
-
-                in_batch_negative_cosine = float(
-                    output["in_batch_negative_cosine"]
-                    .detach()
-                    .item()
-                )
-
-                hard_negative_margin = (
-                    positive_cosine
-                    - hard_negative_cosine
-                )
-
-                in_batch_margin = (
-                    positive_cosine
-                    - in_batch_negative_cosine
-                )
-
-                # ----------------------------------------------------------
-                # Accumulo diagnostiche
-                # ----------------------------------------------------------
-
-                running_positive_cosine += positive_cosine
-
-                running_hard_negative_cosine += (
-                    hard_negative_cosine
-                )
-
-                running_in_batch_negative_cosine += (
-                    in_batch_negative_cosine
-                )
-
-                running_hard_negative_margin += (
-                    hard_negative_margin
-                )
-
-                running_in_batch_margin += (
-                    in_batch_margin
-                )
-
-                running_pos_logit += float(
-                    positive_logits.mean().item()
-                )
-
-                running_max_neg_logit += float(
-                    max_negative.mean().item()
-                )
-
-                running_margin += float(
-                    margin.mean().item()
-                )
-
-                running_rank1 += float(
-                    rank1.item()
-                )
-
-                batch_loss = float(
-                    raw_loss.item()
-                )
-
-                running_loss += batch_loss
-
-                running_loss_sq += (
-                    batch_loss ** 2
-                )
-
-                batch_size_actual = len(
-                    batch["topic_ids"]
-                )
-
-                total_examples += (
-                    batch_size_actual
-                )
-
-                # ----------------------------------------------------------
-                # Domain loss
-                # ----------------------------------------------------------
-
-                if len(unique_domains) == 1:
-
-                    domain = next(
-                        iter(unique_domains)
-                    )
-
-                    domain_loss_sum[
-                        domain
-                    ] += batch_loss
-
-                    domain_batch_count[
-                        domain
-                    ] += 1
-
-                else:
-
-                    for domain in unique_domains:
-
-                        domain_loss_sum[
-                            domain
-                        ] += batch_loss
-
-                        domain_batch_count[
-                            domain
-                        ] += 1
-
-            # -------------------------------------------------------------
-            # Optimizer step
-            # -------------------------------------------------------------
+                    rank1 = torch.ones_like(positive_logits).mean()
+                batch_loss_value = float(raw_loss.detach().float().item())
+                loss_values.append(batch_loss_value)
+                rank1_values.append(float(rank1.item()))
+                margin_values.append(float(margin.mean().item()))
+                pos_cos_values.append(float(output["positive_cosine"].detach().float().item()))
+                hard_cos_values.append(float(output["hard_negative_cosine"].detach().float().item()))
+                inbatch_cos_values.append(float(output["in_batch_negative_cosine"].detach().float().item()))
+                for domain in set(batch.get("domains", [])):
+                    domain_loss[domain].append(batch_loss_value)
 
             should_update = (
-                (batch_idx + 1)
-                % gradient_accumulation_steps
-                == 0
-                or
-                (batch_idx + 1)
-                == len(train_loader)
+                (batch_idx + 1) % gradient_accumulation_steps == 0
+                or (batch_idx + 1) == len(train_loader)
             )
-
-            grad_norm_value = None
-
+            grad_norm_value: Optional[float] = None
             if should_update:
-
                 if scaler is not None:
-
-                    scaler.unscale_(
-                        optimizer
-                    )
-
-                grad_norm = (
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_grad_norm,
-                    )
-                )
-
-                grad_norm_value = float(
-                    grad_norm.item()
-                    if torch.is_tensor(grad_norm)
-                    else grad_norm
-                )
-
-                running_grad_norm_sum += (
-                    grad_norm_value
-                )
-
-                running_grad_norm_max = max(
-                    running_grad_norm_max,
-                    grad_norm_value,
-                )
-
+                    scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, max_grad_norm)
+                grad_norm_value = float(grad_norm.detach().float().item() if torch.is_tensor(grad_norm) else grad_norm)
+                grad_norm_values.append(grad_norm_value)
                 if scaler is not None:
-
-                    scaler.step(
-                        optimizer
-                    )
-
+                    scaler.step(optimizer)
                     scaler.update()
-
                 else:
-
                     optimizer.step()
-
-                optimizer.zero_grad(
-                    set_to_none=True
-                )
-
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
-
                 optimizer_step += 1
 
-                current_lr = float(
-                    optimizer.param_groups[0][
-                        "lr"
-                    ]
-                )
-
-                lr_values.append(
-                    current_lr
-                )
-
             global_step += 1
-
-            # -------------------------------------------------------------
-            # Progress bar
-            # -------------------------------------------------------------
-
-            step_time = (
-                time.time()
-                - batch_start
-            )
-
             progress.set_postfix(
-                loss=f"{batch_loss:.4f}",
-                pos=(
-                    f"{running_pos_logit / (batch_idx + 1):.2f}"
-                ),
-                margin=(
-                    f"{running_margin / (batch_idx + 1):.2f}"
-                ),
-                lr=(
-                    f"{optimizer.param_groups[0]['lr']:.2e}"
-                ),
-                sec=f"{step_time:.2f}",
+                loss=f"{batch_loss_value:.4f}",
+                rank1=f"{rank1.item():.3f}",
+                margin=f"{margin.mean().item():.3f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
-            # -------------------------------------------------------------
-            # Periodic detailed log
-            # -------------------------------------------------------------
-
-            log_every = int(
-                training_cfg.get(
-                    "log_every_n_steps",
-                    25,
-                )
-            )
-
-            if (
-                (batch_idx + 1)
-                % log_every
-                == 0
-            ):
-
+            if (batch_idx + 1) % log_every == 0:
                 logger.info(
-                    f"[E{epoch + 1} "
-                    f"B{batch_idx + 1:04d}] "
-                    f"loss={batch_loss:.4f} | "
-                    f"rank1={rank1.item():.3f} | "
-                    f"pos={positive_logits.mean().item():.3f} | "
-                    f"maxNeg={max_negative.mean().item():.3f} | "
-                    f"margin={margin.mean().item():.3f} | "
-                    f"lr={optimizer.param_groups[0]['lr']:.2e}"
-                    f" | posCos={positive_cosine:.3f}"
-                    f" | hardCos={hard_negative_cosine:.3f}"
-                    f" | inBatchCos={in_batch_negative_cosine:.3f}"
-                    + (
-                        f" | grad={grad_norm_value:.3f}"
-                        if grad_norm_value is not None
-                        else ""
-                    )
+                    "[E%d B%04d] loss=%.4f | rank1=%.3f | margin=%.3f | posCos=%.3f | hardCos=%.3f | inBatchCos=%.3f | lr=%.2e%s",
+                    epoch + 1,
+                    batch_idx + 1,
+                    batch_loss_value,
+                    float(rank1.item()),
+                    float(margin.mean().item()),
+                    pos_cos_values[-1],
+                    hard_cos_values[-1],
+                    inbatch_cos_values[-1],
+                    optimizer.param_groups[0]["lr"],
+                    f" | grad={grad_norm_value:.3f}" if grad_norm_value is not None else "",
                 )
+
+            del q_inputs, pos_inputs, neg_inputs, output, raw_loss, scaled_loss
 
         progress.close()
+        epoch_seconds = time.time() - epoch_start
+        train_loss = float(np.mean(loss_values)) if loss_values else float("nan")
+        train_loss_std = float(np.std(loss_values)) if loss_values else 0.0
+        logger.info(
+            "EPOCH %d SUMMARY | train_loss=%.5f ± %.5f | rank1=%.4f | margin=%.4f | posCos=%.4f | hardCos=%.4f | inBatchCos=%.4f | gradNorm=%.4f | seconds=%.1f",
+            epoch + 1,
+            train_loss,
+            train_loss_std,
+            float(np.mean(rank1_values)) if rank1_values else 0.0,
+            float(np.mean(margin_values)) if margin_values else 0.0,
+            float(np.mean(pos_cos_values)) if pos_cos_values else 0.0,
+            float(np.mean(hard_cos_values)) if hard_cos_values else 0.0,
+            float(np.mean(inbatch_cos_values)) if inbatch_cos_values else 0.0,
+            float(np.mean(grad_norm_values)) if grad_norm_values else 0.0,
+            epoch_seconds,
+        )
+        logger.info("Domain training loss: %s", {domain: round(float(np.mean(values)), 5) for domain, values in domain_loss.items() if values})
 
         # ------------------------------------------------------------------
-        # Epoch training statistics
+        # Validation: dense retrieval on internal conversation-level holdout.
         # ------------------------------------------------------------------
-
-        epoch_time = (
-            time.time()
-            - epoch_start
+        validation = evaluate_dense_validation_per_domain(
+            model=model,
+            val_samples_by_domain=val_samples_by_domain,
+            corpus_by_domain=corpus_by_domain,
+            qrels_by_domain=val_qrels_by_domain,
+            tokenizer=tokenizer,
+            device=device,
+            use_amp=use_amp,
+            max_query_len=max_query_length,
+            max_doc_len=max_doc_length,
+            eval_batch_size=int(evaluation_cfg.get("eval_batch_size", 16)),
+            retrieval_depth=int(evaluation_cfg.get("retrieval_depth", 1000)),
         )
-
-        num_batches = max(
-            1,
-            len(train_loader),
-        )
-
-        train_loss = (
-            running_loss
-            / num_batches
-        )
-
-        loss_variance = max(
-            0.0,
-            (
-                running_loss_sq
-                / num_batches
-            )
-            - train_loss ** 2,
-        )
-
-        train_loss_std = math.sqrt(
-            loss_variance
-        )
-
-        average_rank1 = (
-            running_rank1
-            / num_batches
-        )
-
-        average_pos_logit = (
-            running_pos_logit
-            / num_batches
-        )
-
-        average_max_neg = (
-            running_max_neg_logit
-            / num_batches
-        )
-
-        average_margin = (
-            running_margin
-            / num_batches
-        )
-
-        average_positive_cosine = (
-            running_positive_cosine
-            / num_batches
-        )
-
-        average_hard_negative_cosine = (
-            running_hard_negative_cosine
-            / num_batches
-        )
-
-        average_in_batch_negative_cosine = (
-            running_in_batch_negative_cosine
-            / num_batches
-        )
-
-        average_hard_negative_margin = (
-            running_hard_negative_margin
-            / num_batches
-        )
-
-        average_in_batch_margin = (
-            running_in_batch_margin
-            / num_batches
-        )
-
-        average_grad_norm = (
-            running_grad_norm_sum
-            / max(
-                1,
-                optimizer_step
-                if optimizer_step > 0
-                else 1,
-            )
-        )
-
-        average_lr = (
-            float(np.mean(lr_values))
-            if lr_values
-            else float(
-                optimizer.param_groups[0][
-                    "lr"
-                ]
-            )
-        )
-
-        examples_per_second = (
-            total_examples
-            / max(
-                epoch_time,
-                1e-9,
-            )
-        )
-
-        # ------------------------------------------------------------------
-        # Domain loss diagnostics
-        # ------------------------------------------------------------------
-
-        domain_loss_report = {}
-
-        for domain in domains:
-
-            n_batches = domain_batch_count.get(
-                domain,
-                0,
-            )
-
-            domain_loss_report[domain] = (
-                domain_loss_sum.get(
-                    domain,
-                    0.0,
-                )
-                / max(
-                    1,
-                    n_batches,
-                )
-            )
-
+        macro = validation.get("macro_average", {})
+        val_ndcg = float(macro.get("nDCG@10", 0.0))
         logger.info(
-            "\n"
-            + "-" * 90
+            "VALIDATION MACRO | nDCG@10=%.5f | R@10=%.5f | R@50=%.5f | R@100=%.5f | R@1000=%.5f | MRR=%.5f | domain_std=%.5f",
+            val_ndcg,
+            float(macro.get("Recall@10", 0.0)),
+            float(macro.get("Recall@50", 0.0)),
+            float(macro.get("Recall@100", 0.0)),
+            float(macro.get("Recall@1000", 0.0)),
+            float(macro.get("MRR", 0.0)),
+            float(macro.get("nDCG@10_std", 0.0)),
         )
 
-        logger.info(
-            f"EPOCH {epoch + 1} TRAIN SUMMARY"
-        )
-
-        logger.info(
-            "-" * 90
-        )
-
-        logger.info(
-            f"Train loss              : "
-            f"{train_loss:.5f} ± {train_loss_std:.5f}"
-        )
-
-        logger.info(
-            f"Contrastive rank@1      : "
-            f"{average_rank1:.4f}"
-        )
-
-        logger.info(
-            f"Positive logit          : "
-            f"{average_pos_logit:.4f}"
-        )
-
-        logger.info(
-            f"Max negative logit      : "
-            f"{average_max_neg:.4f}"
-        )
-
-        logger.info(
-            f"Positive-negative margin: "
-            f"{average_margin:.4f}"
-        )
-
-        logger.info(
-            f"Positive cosine         : "
-            f"{average_positive_cosine:.4f}"
-        )
-
-        logger.info(
-            f"Hard-negative cosine    : "
-            f"{average_hard_negative_cosine:.4f}"
-        )
-
-        logger.info(
-            f"In-batch cosine         : "
-            f"{average_in_batch_negative_cosine:.4f}"
-        )
-
-        logger.info(
-            f"Hard-negative margin    : "
-            f"{average_hard_negative_margin:.4f}"
-        )
-
-        logger.info(
-            f"In-batch margin         : "
-            f"{average_in_batch_margin:.4f}"
-        )
-
-        logger.info(
-            f"Average gradient norm   : "
-            f"{average_grad_norm:.4f}"
-        )
-
-        logger.info(
-            f"Maximum gradient norm   : "
-            f"{running_grad_norm_max:.4f}"
-        )
-
-        logger.info(
-            f"Average learning rate   : "
-            f"{average_lr:.3e}"
-        )
-
-        logger.info(
-            f"Optimizer updates       : "
-            f"{optimizer_step}"
-        )
-
-        logger.info(
-            f"Throughput              : "
-            f"{examples_per_second:.2f} examples/s"
-        )
-
-        logger.info(
-            f"Non-finite batches      : "
-            f"{non_finite_batches}"
-        )
-
-        logger.info(
-            f"Mixed-domain batches    : "
-            f"{batches_with_multiple_domains}"
-        )
-
-        for domain in domains:
-
-            logger.info(
-                f"Train loss [{domain:<18}]: "
-                f"{domain_loss_report[domain]:.5f}"
-            )
-
-        # ------------------------------------------------------------------
-        # Validation
-        # ------------------------------------------------------------------
-
-        logger.info(
-            "\n"
-            + "-" * 90
-        )
-
-        logger.info(
-            f"EPOCH {epoch + 1} VALIDATION"
-        )
-
-        logger.info(
-            "-" * 90
-        )
-
-        validation = (
-            evaluate_dense_validation_per_domain(
-                model=model,
-                val_samples_by_domain=val_samples_by_domain,
-                corpus_by_domain=corpus_by_domain,
-                qrels_by_domain=val_qrels_by_domain,
-                tokenizer=tokenizer,
-                device=device,
-                use_amp=use_amp,
-                max_query_len=max_query_length,
-                max_doc_len=max_doc_length,
-                eval_batch_size=int(
-                    evaluation_cfg.get(
-                        "eval_batch_size",
-                        64,
-                    )
-                ),
-                retrieval_depth=int(
-                    evaluation_cfg.get(
-                        "retrieval_depth",
-                        1000,
-                    )
-                ),
-            )
-        )
-
-        macro = validation.get(
-            "macro_average",
-            {},
-        )
-
-        val_ndcg = float(
-            macro.get(
-                "nDCG@10",
-                0.0,
-            )
-        )
-
-        val_recall100 = float(
-            macro.get(
-                "Recall@100",
-                0.0,
-            )
-        )
-
-        val_recall1000 = float(
-            macro.get(
-                "Recall@1000",
-                0.0,
-            )
-        )
-
-        val_mrr = float(
-            macro.get(
-                "MRR",
-                0.0,
-            )
-        )
-
-        logger.info(
-            "\n"
-            + "=" * 90
-        )
-
-        logger.info(
-            f"EPOCH {epoch + 1} VALIDATION MACRO"
-        )
-
-        logger.info(
-            "=" * 90
-        )
-
-        logger.info(
-            f"nDCG@10               : "
-            f"{val_ndcg:.5f}"
-        )
-
-        logger.info(
-            f"Recall@10             : "
-            f"{macro.get('Recall@10', 0.0):.5f}"
-        )
-
-        logger.info(
-            f"Recall@50             : "
-            f"{macro.get('Recall@50', 0.0):.5f}"
-        )
-
-        logger.info(
-            f"Recall@100            : "
-            f"{val_recall100:.5f}"
-        )
-
-        logger.info(
-            f"Recall@500            : "
-            f"{macro.get('Recall@500', 0.0):.5f}"
-        )
-
-        logger.info(
-            f"Recall@1000           : "
-            f"{val_recall1000:.5f}"
-        )
-
-        logger.info(
-            f"MRR                   : "
-            f"{val_mrr:.5f}"
-        )
-
-        logger.info(
-            f"nDCG domain std       : "
-            f"{macro.get('nDCG@10_std', 0.0):.5f}"
-        )
-
-        # ------------------------------------------------------------------
-        # Checkpoint
-        # ------------------------------------------------------------------
-
-        current_score = val_ndcg
-
-        improved = (
-            current_score
-            > best_score
-        )
-
-        epoch_record: Dict[str, Any] = {
+        improved = val_ndcg > best_score
+        epoch_record = {
             "epoch": epoch + 1,
-
             "training": {
                 "loss": train_loss,
                 "loss_std": train_loss_std,
-                "rank1": average_rank1,
-                "positive_logit": average_pos_logit,
-                "max_negative_logit": average_max_neg,
-                "positive_negative_margin": average_margin,
-                "average_grad_norm": average_grad_norm,
-                "max_grad_norm": running_grad_norm_max,
-                "average_learning_rate": average_lr,
-                "optimizer_steps": optimizer_step,
-                "epoch_seconds": epoch_time,
-                "examples": total_examples,
-                "examples_per_second": examples_per_second,
+                "rank1": float(np.mean(rank1_values)) if rank1_values else 0.0,
+                "margin": float(np.mean(margin_values)) if margin_values else 0.0,
+                "positive_cosine": float(np.mean(pos_cos_values)) if pos_cos_values else 0.0,
+                "hard_negative_cosine": float(np.mean(hard_cos_values)) if hard_cos_values else 0.0,
+                "in_batch_negative_cosine": float(np.mean(inbatch_cos_values)) if inbatch_cos_values else 0.0,
+                "gradient_norm": float(np.mean(grad_norm_values)) if grad_norm_values else 0.0,
+                "optimizer_steps_total": optimizer_step,
+                "global_step": global_step,
+                "epoch_seconds": epoch_seconds,
                 "non_finite_batches": non_finite_batches,
-                "mixed_domain_batches": batches_with_multiple_domains,
-                "domain_loss": domain_loss_report,
             },
-
             "validation": validation,
-
             "model_selection": {
-                "monitor": monitor_metric,
-                "score": current_score,
+                "monitor": str(training_cfg.get("monitor_metric", "val_ndcg@10")),
+                "score": val_ndcg,
                 "best_score_before_epoch": best_score,
                 "improved": improved,
             },
         }
-
-        training_history.append(
-            epoch_record
-        )
-
-        history_path = (
-            output_dir
-            / "training_history.json"
-        )
-
-        save_json(
-            training_history,
-            history_path,
-        )
+        training_history.append(epoch_record)
+        save_json(training_history, output_dir / "training_history.json")
 
         if improved:
-
-            best_score = current_score
+            best_score = val_ndcg
             best_epoch = epoch + 1
             epochs_without_improvement = 0
-
-            checkpoint_path = (
-                checkpoint_dir
-                / "best_model.pt"
-            )
-
+            checkpoint_path = checkpoint_dir / "best_model.pt"
+            # Con LoRA salviamo solo i parametri trainabili: il backbone frozen
+            # si ricarica dal model_name_or_path e non deve duplicarsi nel checkpoint.
+            trainable_names = {
+                name for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            }
+            trainable_state = {
+                name: tensor.detach().cpu()
+                for name, tensor in model.state_dict().items()
+                if name in trainable_names
+            }
             checkpoint_payload = {
+                "checkpoint_format": "trainable_parameters_only",
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "optimizer_step": optimizer_step,
-                "model_state_dict": (
-                    model.state_dict()
-                ),
+                "model_state_dict": trainable_state,
                 "best_score": best_score,
-
                 "val_metrics": validation,
-
-                "dataset_diagnostics": (
-                    dataset_report
-                ),
-
-                "formatter_diagnostics": (
-                    formatter_diag
-                ),
-
-                "model_parameters": (
-                    parameter_stats
-                ),
-
+                "dataset_diagnostics": dataset_report,
+                "raw_formatter_diagnostics": raw_formatter.get_diagnostics(),
+                "encoder_formatter_diagnostics": encoder_formatter.get_diagnostics(),
+                "model_parameters": parameter_stats,
                 "config": config,
             }
-
-            torch.save(
-                checkpoint_payload,
-                checkpoint_path,
-            )
-
-            logger.info(
-                f"✓ NEW BEST CHECKPOINT"
-            )
-
-            logger.info(
-                f"  epoch     = {epoch + 1}"
-            )
-
-            logger.info(
-                f"  nDCG@10   = {best_score:.5f}"
-            )
-
-            logger.info(
-                f"  path      = {checkpoint_path}"
-            )
-
-            # Salvataggio di un report dedicato al best.
-            save_json(
-                checkpoint_payload,
-                output_dir
-                / "best_checkpoint_report.json",
-            )
-
+            torch.save(checkpoint_payload, checkpoint_path)
+            # Il report JSON esclude i tensori dei pesi per evitare file enormi
+            # e problemi di serializzazione JSON.
+            checkpoint_report = {
+                key: value for key, value in checkpoint_payload.items()
+                if key != "model_state_dict"
+            }
+            save_json(checkpoint_report, output_dir / "best_checkpoint_report.json")
+            logger.info("NEW BEST CHECKPOINT | epoch=%d | nDCG@10=%.5f | path=%s", best_epoch, best_score, checkpoint_path)
         else:
-
             epochs_without_improvement += 1
-
-            logger.info(
-                f"No improvement "
-                f"({epochs_without_improvement}/"
-                f"{patience})"
-            )
-
-        # ------------------------------------------------------------------
-        # Early stopping
-        # ------------------------------------------------------------------
-
-        if (
-            epochs_without_improvement
-            >= patience
-        ):
-
-            logger.info(
-                "\nEarly stopping triggered."
-            )
-
-            break
+            logger.info("No validation improvement (%d/%d).", epochs_without_improvement, patience)
 
         clear_device_cache(device)
+        if epochs_without_improvement >= patience:
+            logger.info("Early stopping triggered.")
+            break
 
-    # =========================================================================
-    # Final report
-    # =========================================================================
-
+    # ----------------------------------------------------------------------
+    # Reports and reproducibility metadata
+    # ----------------------------------------------------------------------
     final_report = {
         "status": "completed",
-
         "best_epoch": best_epoch,
-        "best_val_ndcg@10": (
-            None
-            if best_score == -float("inf")
-            else best_score
-        ),
-
+        "best_val_ndcg@10": None if best_score == -float("inf") else best_score,
         "epochs_requested": epochs,
-        "epochs_completed": len(
-            training_history
-        ),
-
+        "epochs_completed": len(training_history),
         "domains": domains,
-
         "model": {
             "name": model_name,
-            "pooling": bi_cfg.get(
-                "pooling_strategy",
-                "cls",
-            ),
-            "temperature": bi_cfg.get(
-                "temperature",
-                0.05,
-            ),
-            "normalize_embeddings": bi_cfg.get(
-                "normalize_embeddings",
-                True,
-            ),
-            "lora_enabled": bool(
-                lora_cfg.get(
-                    "enabled",
-                    False,
-                )
-            ),
-            "gradient_checkpointing": (
-                gradient_checkpointing
-            ),
+            "pooling": getattr(model, "pooling_strategy", bi_cfg.get("pooling_strategy", "last_token")),
+            "temperature": float(bi_cfg.get("temperature", 0.05)),
+            "normalize_embeddings": bool(bi_cfg.get("normalize_embeddings", True)),
+            "lora_enabled": bool(lora_cfg.get("enabled", False)),
+            "gradient_checkpointing": gradient_checkpointing,
             "parameters": parameter_stats,
         },
-
+        "query_rewriting": {
+            "enabled": bool(rewrite_cfg.get("enabled", False)) and query_mode != "contextual",
+            "model_name_or_path": rewrite_cfg.get("model_name_or_path"),
+            "cache_tag": rewrite_cfg.get("cache_tag"),
+            "load_in_4bit": bool(rewrite_cfg.get("load_in_4bit", False)),
+            "max_new_tokens": int(rewrite_cfg.get("max_new_tokens", 64)),
+            "cache_dir": paths_cfg.get("query_rewrites_cache_dir"),
+            "query_mode": query_mode,
+        },
         "data": {
+            "data_mode": data_mode,
             "query_strategy": query_strategy,
             "max_query_length": max_query_length,
             "max_doc_length": max_doc_length,
-            "negatives_per_positive": requested_k,
-            "hard_negative_pool_size": int(
-                data_cfg.get(
-                    "hard_negative_pool_size",
-                    50,
-                )
-            ),
-            "negative_sampling_strategy": data_cfg.get(
-                "negative_sampling_strategy",
-                "bm25_hard",
-            ),
-            "internal_validation_ratio": (
-                internal_val_ratio
-            ),
+            "query_mode": query_mode,
+            "negatives_per_positive": int(data_cfg.get("negatives_per_positive", 2)),
+            "hard_negative_pool_size": hard_neg_top_k,
+            "negative_sampling_strategy": data_cfg.get("negative_sampling_strategy", "bm25_hard"),
+            "internal_validation_ratio": val_ratio,
             "dataset_diagnostics": dataset_report,
-            "formatter_diagnostics": formatter_diag,
         },
-
         "training": {
             "batch_size": batch_size,
-            "gradient_accumulation_steps": (
-                gradient_accumulation_steps
-            ),
+            "gradient_accumulation_steps": gradient_accumulation_steps,
             "epochs": epochs,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
             "warmup_ratio": warmup_ratio,
             "max_grad_norm": max_grad_norm,
+            "seed": seed,
+            "device": str(device),
+            "mixed_precision": use_amp,
         },
-
         "history": training_history,
     }
-
-    save_json(
-        final_report,
-        output_dir
-        / "final_training_report.json",
-    )
-
-    logger.info(
-        "\n"
-        + "=" * 90
-    )
-
-    logger.info(
-        "TRAINING COMPLETED"
-    )
-
-    logger.info(
-        "=" * 90
-    )
-
-    logger.info(
-        f"Best epoch       : {best_epoch}"
-    )
-
-    logger.info(
-        f"Best val nDCG@10  : {best_score:.5f}"
-    )
-
-    logger.info(
-        f"History           : "
-        f"{output_dir / 'training_history.json'}"
-    )
-
-    logger.info(
-        f"Final report      : "
-        f"{output_dir / 'final_training_report.json'}"
-    )
+    save_json(final_report, output_dir / "final_training_report.json")
+    logger.info("=" * 88)
+    logger.info("TRAINING COMPLETED | best_epoch=%d | best_val_nDCG@10=%.5f", best_epoch, best_score)
+    logger.info("History: %s", output_dir / "training_history.json")
+    logger.info("Final report: %s", output_dir / "final_training_report.json")
 
 
 # =============================================================================
@@ -2657,89 +1014,36 @@ def train_bi_encoder(
 # =============================================================================
 
 def main() -> None:
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "RETECO Sub-track 2a "
-            "diagnostic training"
-        )
-    )
-
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config/config.yaml",
-    )
-
+    parser = argparse.ArgumentParser(description="RETECO Sub-track 2a: query reasoning + Qwen3-Embedding fine-tuning")
+    parser.add_argument("--config", type=str, default="subtrack_2a/config/config.yaml")
     args = parser.parse_args()
 
-    config_path = Path(
-        args.config
-    )
-
+    config_path = Path(args.config)
+    if not config_path.exists() and config_path.parts and config_path.parts[0] == "subtrack_2a":
+        config_path = Path(*config_path.parts[1:])
     if not config_path.exists():
-
-        config_path = (
-            Path("config")
-            / config_path.name
-        )
-
+        alternative = Path("config") / config_path.name
+        if alternative.exists():
+            config_path = alternative
     if not config_path.exists():
+        raise FileNotFoundError(f"Config non trovato: {args.config}")
 
-        raise FileNotFoundError(
-            f"Config non trovato: "
-            f"{args.config}"
-        )
-
-    config = load_config(
-        config_path
-    )
-
-    # File logger dopo il caricamento della config.
-    paths_cfg = config.get(
-        "paths",
-        {},
-    )
-
-    general_cfg = config.get(
-        "general",
-        {},
-    )
-
-    log_dir = Path(
-        paths_cfg.get(
-            "log_dir",
-            "outputs/subtrack_2a/logs",
-        )
-    )
-
-    run_tag = general_cfg.get(
-        "run_tag",
-        "reteco_2a",
-    )
-
-    log_level = general_cfg.get(
-        "logging_level",
-        "INFO",
-    )
-
-    global logger
-
+    config = load_config(config_path)
+    paths_cfg = config.get("paths", {})
+    general_cfg = config.get("general", {})
     try:
-
-        logger = setup_logger(
-            log_dir=log_dir,
-            run_tag=f"train_{run_tag}",
-            log_level=log_level,
+        configured_logger = setup_logger(
+            log_dir=Path(paths_cfg.get("log_dir", "outputs/subtrack_2a/logs")),
+            run_tag=f"train_{general_cfg.get('run_tag', 'qwen3_reasoning_hybrid_v1')}",
+            log_level=general_cfg.get("logging_level", "INFO"),
         )
+        if configured_logger is not None:
+            global logger
+            logger = configured_logger
+    except Exception as exc:
+        logger.warning("File logger non inizializzato; uso il logger standard: %s", exc)
 
-    except Exception:
-
-        pass
-
-    train_bi_encoder(
-        config
-    )
+    train_bi_encoder(config)
 
 
 if __name__ == "__main__":

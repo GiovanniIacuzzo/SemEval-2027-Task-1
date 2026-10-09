@@ -1,43 +1,64 @@
+general:
+  seed: 42
+  device: "auto"                 # auto | cuda | mps | cpu
+  mixed_precision: true
+  run_tag: "qwen3_reasoning_hybrid_v1"
+  logging_level: "INFO"
+
 paths:
-  data_mode: "full"   # oppure "sample"
+  data_mode: "full"               # full | sample
   full_data_dir: "data/reteco_data/track2_recor"
   sample_data_dir: "data/sample/track2_recor"
-  checkpoint_dir: "checkpoints/subtrack_2a/bi_encoder"
-  output_dir: "outputs/subtrack_2a"
+  checkpoint_dir: "checkpoints/subtrack_2a/qwen3_embedding_0.6b_reasoning"
+  output_dir: "outputs/subtrack_2a/qwen3_embedding_0.6b_reasoning"
   log_dir: "outputs/subtrack_2a/logs"
   embedding_cache_dir: "data/cache/document_embeddings"
   hard_negatives_cache_dir: "data/cache/hard_negatives"
+  query_rewrites_cache_dir: "data/cache/query_rewrites/subtrack_2a"
 
 domains:
-  active_domains:
-    - drones
+  active_domains: "all"
   domain_balanced_training: true
 
 data:
   query_strategy: "history"
-  max_query_length: 256
-  max_doc_length: 256
+  max_query_length: 512
+  max_doc_length: 384
   num_workers: 0
-  pin_memory: false
-
+  pin_memory: true
   negatives_per_positive: 2
-  hard_negative_pool_size: 20
+  hard_negative_pool_size: 40
   negative_sampling_strategy: "bm25_hard"
-
   val_ratio: 0.15
+  query_mode: "alternate"
+  require_reasoned_queries: true
+
+query_rewriting:
+  enabled: true
+  model_name_or_path: "Qwen/Qwen3-4B-Instruct-2507"
+  load_in_4bit: true
+  torch_dtype: "float16"
+  device_map: "auto"
+  trust_remote_code: false
+  max_new_tokens: 64
+  max_input_tokens: 4096
+  max_history_tokens: 3000
+  overwrite_cache: false
+  # Cambiare il tag quando si cambia prompt o impostazione del generatore.
+  cache_tag: "qwen3_4b_instruct_2507_rewrite_v1"
 
 bi_encoder:
-  model_name_or_path: "BAAI/bge-base-en-v1.5"
-
-  pooling_strategy: "cls"
+  model_name_or_path: "Qwen/Qwen3-Embedding-0.6B"
+  pooling_strategy: "last_token"
   normalize_embeddings: true
   temperature: 0.05
-
-  gradient_checkpointing: false
+  gradient_checkpointing: true
 
   query_instruction:
     enabled: true
-    text: "Represent this sentence for searching relevant passages: "
+    text: |-
+      Instruct: Given a conversational information-seeking query, retrieve relevant documents from the provided corpus that satisfy the user's information need.
+      Query:
 
 lora:
   enabled: true
@@ -48,24 +69,23 @@ lora:
   bias: "none"
 
 training:
-  epochs: 1
+  epochs: 2
   batch_size: 4
-  gradient_accumulation_steps: 1
-
-  learning_rate: 1.0e-4
+  gradient_accumulation_steps: 2
+  learning_rate: 3.0e-5
   weight_decay: 0.01
-  warmup_ratio: 0.1
-
+  warmup_ratio: 0.06
   max_grad_norm: 1.0
-
   negative_chunk_size: 8
-
   monitor_metric: "val_ndcg@10"
   early_stopping_patience: 1
-
-  log_every_n_steps: 10
+  log_every_n_steps: 20
 
 evaluation:
   eval_batch_size: 16
   retrieval_depth: 1000
   cutoff_k: 10
+
+sparse:
+  k1: 0.9
+  b: 0.4
