@@ -180,11 +180,6 @@ def prepare_query_rewrites(
                     trust_remote_code=bool(rewrite_cfg.get("trust_remote_code", False)),
                 )
 
-            updated = rewriter.rewrite_samples(
-                missing,
-                existing=existing,
-                overwrite=False,
-            )
             metadata = {
                 "purpose": "subtrack_2a_training_query_rewrites",
                 "domain": domain,
@@ -196,6 +191,28 @@ def prepare_query_rewrites(
                 "deterministic_decoding": True,
                 "prompt_version": "ConversationalQueryRewriter.SYSTEM_PROMPT/v1",
             }
+
+            def persist_rewrite_checkpoint(
+                current_rewrites: Dict[str, str],
+            ) -> None:
+                save_query_rewrites(
+                    cache_path,
+                    current_rewrites,
+                    metadata=metadata,
+                )
+
+            checkpoint_every = int(
+                rewrite_cfg.get("checkpoint_every", 8)
+            )
+            updated = rewriter.rewrite_samples(
+                missing,
+                existing=existing,
+                overwrite=False,
+                progress_desc=f"Rewrite [{domain}]",
+                checkpoint_every=checkpoint_every,
+                checkpoint_callback=persist_rewrite_checkpoint,
+            )
+
             save_query_rewrites(cache_path, updated, metadata=metadata)
             existing = updated
             logger.info("[REWRITE/%s] saved %d rewrites to %s", domain, len(existing), cache_path)

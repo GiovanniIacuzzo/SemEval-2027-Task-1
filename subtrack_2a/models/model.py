@@ -24,7 +24,7 @@ Nota Qwen3-Embedding:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -603,15 +603,45 @@ Return only the rewritten search query, on one line, with no explanation, headin
         samples: Iterable[Any],
         existing: Optional[Dict[str, str]] = None,
         overwrite: bool = False,
+        *,
+        progress_desc: str = "Rewriting conversational queries",
+        checkpoint_every: int = 8,
+        checkpoint_callback: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> Dict[str, str]:
-        """Genera una cache ``topic_id -> query riscritta`` per sample o dict.
+        """Genera query riscritte mostrando il progresso e salvando checkpoint.
 
         Ogni elemento deve esporre ``topic_id``, ``query`` e ``history`` come
         attributi oppure chiavi di dizionario. Le voci già presenti in
         ``existing`` vengono riutilizzate salvo ``overwrite=True``.
+
+        ``checkpoint_callback`` viene invocata ogni ``checkpoint_every`` nuove
+        riscritture e al termine. Il callback riceve una copia della cache
+        completa (voci precedenti incluse), così il chiamante può salvarla in
+        modo atomico e riprendere il lavoro dopo un'interruzione.
         """
+        # Materializza l'iterabile per mostrare un totale stabile nella progress bar.
+        sample_list = list(samples)
         rewrites = dict(existing or {})
-        for sample in samples:
+        checkpoint_every = max(1, int(checkpoint_every))
+        generated_since_checkpoint = 0
+
+        try:
+            from tqdm.auto import tqdm
+        except ImportError:  # pragma: no cover - fallback minimale
+            tqdm = None
+
+        iterator = sample_list
+        if tqdm is not None:
+            iterator = tqdm(
+                sample_list,
+                total=len(sample_list),
+                desc=progress_desc,
+                unit="query",
+                dynamic_ncols=True,
+                leave=True,
+            )
+
+        for sample in iterator:
             if isinstance(sample, dict):
                 topic_id = str(sample["topic_id"])
                 query = str(sample.get("query", ""))
@@ -622,8 +652,36 @@ Return only the rewritten search query, on one line, with no explanation, headin
                 history = str(sample.history)
 
             if topic_id in rewrites and not overwrite:
+                if tqdm is not None:
+                    iterator.set_postfix_str("cached", refresh=False)
                 continue
-            rewrites[topic_id] = self.rewrite(query=query, history=history)
+
+            rewritten = self.rewrite(query=query, history=history)
+            rewrites[topic_id] = rewritten or query.strip()
+            generated_since_checkpoint += 1
+
+            if tqdm is not None:
+                iterator.set_postfix_str(
+                    f"last={topic_id[:28]}",
+                    refresh=False,
+                )
+
+            if (
+                checkpoint_callback is not None
+                and generated_since_checkpoint >= checkpoint_every
+            ):
+                checkpoint_callback(dict(rewrites))
+                generated_since_checkpoint = 0
+                if tqdm is not None:
+                    iterator.set_postfix_str(
+                        f"last={topic_id[:20]} | cache saved",
+                        refresh=False,
+                    )
+
+        # Salva sempre l'eventuale ultimo gruppo più piccolo del checkpoint.
+        if checkpoint_callback is not None:
+            checkpoint_callback(dict(rewrites))
+
         return rewrites
 
 

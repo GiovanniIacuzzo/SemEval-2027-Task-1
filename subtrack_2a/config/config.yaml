@@ -1,7 +1,7 @@
 general:
   seed: 42
   device: "auto"                 # auto | cuda | mps | cpu
-  mixed_precision: true
+  mixed_precision: true            # FP16 su CUDA; disabilitato automaticamente altrove
   run_tag: "qwen3_reasoning_hybrid_v1"
   logging_level: "INFO"
 
@@ -43,6 +43,7 @@ query_rewriting:
   max_new_tokens: 64
   max_input_tokens: 4096
   max_history_tokens: 3000
+  checkpoint_every: 8
   overwrite_cache: false
   # Cambiare il tag quando si cambia prompt o impostazione del generatore.
   cache_tag: "qwen3_4b_instruct_2507_rewrite_v1"
