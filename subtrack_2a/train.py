@@ -204,10 +204,11 @@ def prepare_query_rewrites(
             checkpoint_every = int(
                 rewrite_cfg.get("checkpoint_every", 8)
             )
-            updated = rewriter.rewrite_samples(
+            updated = rewriter.rewrite_batch(
                 missing,
                 existing=existing,
                 overwrite=False,
+                batch_size=int(rewrite_cfg.get("batch_size", 4)),
                 progress_desc=f"Rewrite [{domain}]",
                 checkpoint_every=checkpoint_every,
                 checkpoint_callback=persist_rewrite_checkpoint,

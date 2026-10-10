@@ -597,93 +597,176 @@ Return only the rewritten search query, on one line, with no explanation, headin
         )
         return self._normalize_output(decoded, fallback_query=query)
 
+
     @torch.inference_mode()
-    def rewrite_samples(
+    def rewrite_batch(
         self,
         samples: Iterable[Any],
         existing: Optional[Dict[str, str]] = None,
         overwrite: bool = False,
         *,
+        batch_size: int = 4,
         progress_desc: str = "Rewriting conversational queries",
         checkpoint_every: int = 8,
-        checkpoint_callback: Optional[Callable[[Dict[str, str]], None]] = None,
+        checkpoint_callback: Optional[
+            Callable[[Dict[str, str]], None]
+        ] = None,
     ) -> Dict[str, str]:
-        """Genera query riscritte mostrando il progresso e salvando checkpoint.
-
-        Ogni elemento deve esporre ``topic_id``, ``query`` e ``history`` come
-        attributi oppure chiavi di dizionario. Le voci già presenti in
-        ``existing`` vengono riutilizzate salvo ``overwrite=True``.
-
-        ``checkpoint_callback`` viene invocata ogni ``checkpoint_every`` nuove
-        riscritture e al termine. Il callback riceve una copia della cache
-        completa (voci precedenti incluse), così il chiamante può salvarla in
-        modo atomico e riprendere il lavoro dopo un'interruzione.
         """
-        # Materializza l'iterabile per mostrare un totale stabile nella progress bar.
+        Genera query riscritte in batch.
+
+        Ogni sample deve esporre topic_id, query e history come
+        attributi oppure come chiavi di dizionario.
+
+        Le riscritture già presenti nella cache vengono riutilizzate,
+        salvo overwrite=True. Il callback permette di salvare la cache
+        periodicamente, anche durante la generazione.
+        """
+        if batch_size <= 0:
+            raise ValueError("batch_size deve essere > 0.")
+
+        if checkpoint_every <= 0:
+            raise ValueError("checkpoint_every deve essere > 0.")
+
         sample_list = list(samples)
         rewrites = dict(existing or {})
-        checkpoint_every = max(1, int(checkpoint_every))
+
+        pending = []
+
+        for sample in sample_list:
+            if isinstance(sample, dict):
+                topic_id = str(sample["topic_id"])
+                query = str(sample.get("query", "") or "").strip()
+                history = str(sample.get("history", "") or "")
+            else:
+                topic_id = str(sample.topic_id)
+                query = str(sample.query or "").strip()
+                history = str(sample.history or "")
+
+            if not overwrite and topic_id in rewrites:
+                continue
+
+            pending.append((topic_id, query, history))
+
+        # Nessuna generazione necessaria: conserva la cache esistente.
+        if not pending:
+            if checkpoint_callback is not None:
+                checkpoint_callback(dict(rewrites))
+            return rewrites
+
+        from tqdm.auto import tqdm
+
+        # Per la generazione batch di modelli decoder-only è importante
+        # utilizzare il padding a sinistra.
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+
+        input_device = self.device
+        if input_device is None:
+            try:
+                input_device = self.model.device
+            except Exception:
+                input_device = next(self.model.parameters()).device
+
         generated_since_checkpoint = 0
 
         try:
-            from tqdm.auto import tqdm
-        except ImportError:  # pragma: no cover - fallback minimale
-            tqdm = None
-
-        iterator = sample_list
-        if tqdm is not None:
-            iterator = tqdm(
-                sample_list,
-                total=len(sample_list),
+            with tqdm(
+                total=len(pending),
                 desc=progress_desc,
                 unit="query",
                 dynamic_ncols=True,
                 leave=True,
-            )
+            ) as progress:
 
-        for sample in iterator:
-            if isinstance(sample, dict):
-                topic_id = str(sample["topic_id"])
-                query = str(sample.get("query", ""))
-                history = str(sample.get("history", ""))
-            else:
-                topic_id = str(sample.topic_id)
-                query = str(sample.query)
-                history = str(sample.history)
+                for start in range(0, len(pending), batch_size):
+                    batch = pending[start:start + batch_size]
 
-            if topic_id in rewrites and not overwrite:
-                if tqdm is not None:
-                    iterator.set_postfix_str("cached", refresh=False)
-                continue
+                    # L'ordine dei prompt e quello delle risposte
+                    # rimangono allineati tramite topic_id.
+                    prompts = [
+                        self._build_prompt(query=query, history=history)
+                        for _, query, history in batch
+                    ]
 
-            rewritten = self.rewrite(query=query, history=history)
-            rewrites[topic_id] = rewritten or query.strip()
-            generated_since_checkpoint += 1
-
-            if tqdm is not None:
-                iterator.set_postfix_str(
-                    f"last={topic_id[:28]}",
-                    refresh=False,
-                )
-
-            if (
-                checkpoint_callback is not None
-                and generated_since_checkpoint >= checkpoint_every
-            ):
-                checkpoint_callback(dict(rewrites))
-                generated_since_checkpoint = 0
-                if tqdm is not None:
-                    iterator.set_postfix_str(
-                        f"last={topic_id[:20]} | cache saved",
-                        refresh=False,
+                    # Una sola tokenizzazione batch per questo gruppo.
+                    encoded = self.tokenizer(
+                        prompts,
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_input_tokens,
+                        return_tensors="pt",
                     )
 
-        # Salva sempre l'eventuale ultimo gruppo più piccolo del checkpoint.
+                    input_width = encoded["input_ids"].shape[1]
+
+                    # Passiamo soltanto gli input standard del modello
+                    # causale e spostiamo i tensori sul device d'ingresso.
+                    model_inputs = {
+                        key: value.to(input_device)
+                        for key, value in encoded.items()
+                        if key in {"input_ids", "attention_mask"}
+                    }
+
+                    output_ids = self.model.generate(
+                        **model_inputs,
+                        max_new_tokens=self.max_new_tokens,
+                        do_sample=False,
+                        num_beams=1,
+                        use_cache=True,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                    # generate() restituisce prompt + continuazione.
+                    # input_width include anche il padding sinistro.
+                    generated_ids = output_ids[:, input_width:]
+
+                    decoded_batch = self.tokenizer.batch_decode(
+                        generated_ids,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+
+                    for (topic_id, query, _), decoded in zip(
+                        batch, decoded_batch
+                    ):
+                        rewrites[topic_id] = self._normalize_output(
+                            decoded,
+                            fallback_query=query,
+                        ) or query
+
+                    completed = len(batch)
+                    generated_since_checkpoint += completed
+
+                    progress.update(completed)
+                    progress.set_postfix(
+                        batch=len(batch),
+                        cached=len(rewrites) - len(batch),
+                    )
+
+                    # Salvataggio periodico della cache.
+                    # Con batch_size=4 e checkpoint_every=8 si salva
+                    # normalmente ogni due batch.
+                    if (
+                        checkpoint_callback is not None
+                        and generated_since_checkpoint >= checkpoint_every
+                    ):
+                        checkpoint_callback(dict(rewrites))
+                        generated_since_checkpoint = 0
+                        progress.set_postfix(
+                            batch=len(batch),
+                            cache="saved",
+                        )
+
+        finally:
+            self.tokenizer.padding_side = original_padding_side
+
+        # Salvataggio finale, inclusa l'ultima frazione del checkpoint.
         if checkpoint_callback is not None:
             checkpoint_callback(dict(rewrites))
 
         return rewrites
-
 
 # =============================================================================
 # Cross-Encoder
