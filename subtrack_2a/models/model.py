@@ -354,10 +354,12 @@ class ConversationalBiEncoder(nn.Module):
 
         positive_logits = (positive_cosine / self.temperature).unsqueeze(1)
         hard_negative_logits = hard_negative_cosine / self.temperature
-        in_batch_cosine_for_logits = all_positive_cosine.masked_fill(
-            diagonal_mask, -1e4
+
+        all_pos_scaled = all_positive_cosine / self.temperature
+        in_batch_negative_logits = all_pos_scaled.masked_fill(
+            diagonal_mask, -1000.0
         )
-        in_batch_negative_logits = in_batch_cosine_for_logits / self.temperature
+        
         logits = torch.cat(
             [positive_logits, hard_negative_logits, in_batch_negative_logits],
             dim=-1,

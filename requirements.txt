@@ -9,3 +9,5 @@ safetensors>=0.4
 rouge-score>=0.1.2
 nltk>=3.9
 bert-score>=0.3.13
+pyserini
+pytrec_eval

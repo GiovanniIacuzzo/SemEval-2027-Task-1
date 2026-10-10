@@ -89,9 +89,24 @@ class ContextAwareQueryFormatter:
         - budget_context (alias di history)
         - concat (alias di history)
 
-    La query corrente ha priorità sul contesto. Con Qwen3-Embedding passare
-    ``query_instruction`` per anteporre l'istruzione richiesta dal modello.
-    L'istruzione viene applicata soltanto alle query, mai ai documenti.
+    Layout con cronologia (la domanda corrente è SEMPRE l'ultima parte della
+    sequenza, così che un modello causale decoder-only con pooling
+    ``last_token`` possa prestare attenzione alla cronologia e produca
+    l'embedding sull'ultimo token della domanda):
+
+        {istruzione}
+        Context:
+        {history troncata da sinistra}
+
+        Query: {domanda corrente}
+
+    Senza cronologia: ``{istruzione} {domanda corrente}``.
+
+    La query corrente e l'istruzione hanno priorità sul contesto: se il budget
+    ``max_query_length`` viene superato, viene troncata (da sinistra) soltanto
+    la cronologia. Con Qwen3-Embedding passare ``query_instruction`` per
+    anteporre l'istruzione richiesta dal modello. L'istruzione viene applicata
+    soltanto alle query, mai ai documenti.
     """
 
     HISTORY_ALIASES = {"history", "budget_context", "concat"}
@@ -190,6 +205,13 @@ class ContextAwareQueryFormatter:
         return f"{prefix}{query}".strip()
 
     def format(self, query: str, history: str) -> str:
+        """Formatta la query corrente, anteponendo la cronologia alla domanda.
+
+        La domanda corrente è collocata tassativamente alla fine della
+        sequenza. Istruzione e domanda sono preservate integralmente (salvo
+        troncamento della sola domanda se, da sole, eccedono il budget);
+        se necessario viene troncata da sinistra esclusivamente la cronologia.
+        """
         self.stats["total_queries"] += 1
         query = (query or "").strip()
         history = (history or "").strip()
@@ -202,55 +224,68 @@ class ContextAwareQueryFormatter:
 
         prefix = self._instruction_prefix()
 
+        # La domanda deve comunque entrare, insieme all'istruzione, nel budget.
+        prefix_tokens = self._count_tokens(prefix)
+        available_for_query = max(1, self.max_query_length - prefix_tokens)
+        query = self._truncate_query_to_budget(query, available_for_query)
+
+        def _finalize(text: str) -> str:
+            self.stats["final_tokens"] += min(
+                self._count_tokens(text), self.max_query_length
+            )
+            return text
+
+        # Formato senza cronologia: {istruzione_prefisso}{domanda_corrente}
+        query_only_text = f"{prefix}{query}".strip()
+
         # ------------------------------------------------------------------
         # Query corrente senza cronologia
         # ------------------------------------------------------------------
         if self.strategy == "query_only" or not history:
-            prefix_tokens = self._count_tokens(prefix)
-            available = max(1, self.max_query_length - prefix_tokens)
-            query = self._truncate_query_to_budget(query, available)
-            formatted = f"{prefix}{query}".strip()
-            self.stats["final_tokens"] += min(
-                self._count_tokens(formatted), self.max_query_length
-            )
-            return formatted
+            return _finalize(query_only_text)
 
-        # ------------------------------------------------------------------
-        # Query + history sotto lo stesso budget
-        # ------------------------------------------------------------------
-        query_part = f"{prefix}{query}".strip()
-        history_header = "\n\nConversation History:\n"
-        fixed_text = f"{query_part}{history_header}"
-        fixed_len = self._count_tokens(fixed_text)
-
-        if fixed_len > self.max_query_length:
-            prefix_tokens = self._count_tokens(prefix)
-            header_tokens = self._count_tokens(history_header)
-            available_for_query = max(
-                1,
-                self.max_query_length - prefix_tokens - header_tokens,
-            )
-            query = self._truncate_query_to_budget(query, available_for_query)
-            query_part = f"{prefix}{query}".strip()
-            fixed_text = f"{query_part}{history_header}"
-            fixed_len = self._count_tokens(fixed_text)
-
-        residual_budget = max(0, self.max_query_length - fixed_len)
-        retained_history = self._truncate_history_from_left(
-            history,
-            residual_budget,
+        instruction_line = (
+            f"{self.query_instruction}\n" if self.query_instruction else ""
         )
-        if retained_history:
-            self.stats["history_used"] += 1
-            self.stats["retained_history_tokens"] += self._count_tokens(
-                retained_history
-            )
+        head = f"{instruction_line}Context:\n"
+        tail = f"\n\nQuery: {query}"
 
-        formatted = f"{fixed_text}{retained_history}".strip()
-        self.stats["final_tokens"] += min(
-            self._count_tokens(formatted), self.max_query_length
+        def _build(history_text: str) -> str:
+            return f"{head}{history_text}{tail}"
+
+        skeleton_len = self._count_tokens(_build(""))
+        residual_budget = self.max_query_length - skeleton_len
+        if residual_budget <= 0:
+            # Nessuno spazio per la cronologia: si preservano istruzione e
+            # domanda con il formato senza contesto.
+            return _finalize(query_only_text)
+
+        history_ids = self._encode(history)
+        budget = min(len(history_ids), residual_budget)
+        retained_history = ""
+        formatted = ""
+        # Troncamento da sinistra della sola cronologia. Il ciclo copre
+        # eventuali discrepanze di tokenizzazione ai confini della concatenazione.
+        while budget > 0:
+            candidate_history = self._decode(history_ids[-budget:])
+            candidate = _build(candidate_history)
+            overflow = self._count_tokens(candidate) - self.max_query_length
+            if overflow <= 0:
+                retained_history = candidate_history
+                formatted = candidate
+                break
+            budget -= overflow
+
+        if not retained_history:
+            return _finalize(query_only_text)
+
+        if budget < len(history_ids):
+            self.stats["history_truncated"] += 1
+        self.stats["history_used"] += 1
+        self.stats["retained_history_tokens"] += self._count_tokens(
+            retained_history
         )
-        return formatted
+        return _finalize(formatted)
 
     def get_diagnostics(self) -> Dict[str, float]:
         n = max(1, self.stats["total_queries"])

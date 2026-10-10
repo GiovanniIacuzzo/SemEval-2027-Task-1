@@ -1,7 +1,7 @@
 general:
   seed: 42
-  device: "auto"                 # auto | cuda | mps | cpu
-  mixed_precision: true            # FP16 su CUDA; disabilitato automaticamente altrove
+  device: "auto"                   # auto | cuda | mps | cpu
+  mixed_precision: true            # AMP su CUDA (BF16 se supportato, altrimenti FP16); disabilitato altrove
   run_tag: "qwen3_reasoning_hybrid_v1"
   logging_level: "INFO"
 
@@ -9,9 +9,11 @@ paths:
   data_mode: "full"               # full | sample
   full_data_dir: "data/reteco_data/track2_recor"
   sample_data_dir: "data/sample/track2_recor"
+
   checkpoint_dir: "checkpoints/subtrack_2a/qwen3_embedding_0.6b_reasoning"
   output_dir: "outputs/subtrack_2a/qwen3_embedding_0.6b_reasoning"
   log_dir: "outputs/subtrack_2a/logs"
+
   embedding_cache_dir: "data/cache/document_embeddings"
   hard_negatives_cache_dir: "data/cache/hard_negatives"
   query_rewrites_cache_dir: "data/cache/query_rewrites/subtrack_2a"
@@ -26,10 +28,15 @@ data:
   max_doc_length: 384
   num_workers: 0
   pin_memory: true
+
   negatives_per_positive: 2
   hard_negative_pool_size: 40
   negative_sampling_strategy: "bm25_hard"
+
   val_ratio: 0.15
+
+  # contextual | reasoned | alternate. Alternate cambia query per epoca,
+  # senza duplicare il topic nel medesimo dataset.
   query_mode: "alternate"
   require_reasoned_queries: true
 
@@ -43,7 +50,7 @@ query_rewriting:
   max_new_tokens: 64
   max_input_tokens: 4096
   max_history_tokens: 3000
-  checkpoint_every: 8
+  checkpoint_every: 8             # salva la cache progressiva ogni 8 query generate (~ogni 2 batch)
   overwrite_cache: false
   # Cambiare il tag quando si cambia prompt o impostazione del generatore.
   cache_tag: "qwen3_4b_instruct_2507_rewrite_v1"
@@ -78,14 +85,17 @@ training:
   warmup_ratio: 0.06
   max_grad_norm: 1.0
   negative_chunk_size: 8
-  monitor_metric: "val_ndcg@10"
+  monitor_metric: "val_ndcg@10_reasoned"
   early_stopping_patience: 1
   log_every_n_steps: 20
 
 evaluation:
-  eval_batch_size: 16
+  eval_batch_size: 64
   retrieval_depth: 1000
   cutoff_k: 10
+
+  compare_query_modes: true
+  selection_query_mode: "reasoned"  # reasoned | contextual
 
 sparse:
   k1: 0.9

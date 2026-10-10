@@ -4,7 +4,8 @@
 Nuova configurazione:
     1. legge esclusivamente benchmark_train e il corpus RETECO ufficiale;
     2. crea una validation interna con split a livello di conversazione;
-    3. genera/cache-a query autonome solo per il sottoinsieme di training;
+    3. genera/cache-a query autonome per training e validation interna
+       (le riscritture non usano mai i qrels);
     4. mina hard negative BM25 usando query senza istruzione del dense encoder;
     5. addestra Qwen3-Embedding-0.6B con LoRA e InfoNCE;
     6. seleziona il checkpoint tramite nDCG@10 sulla validation interna.
@@ -91,9 +92,16 @@ def resolve_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
+def resolve_amp_dtype(device: torch.device) -> torch.dtype:
+    """BF16 se la GPU lo supporta (nessun overflow FP16), altrimenti FP16."""
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 def autocast_context(device: torch.device, enabled: bool):
     if enabled and device.type == "cuda":
-        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+        return torch.amp.autocast(device_type="cuda", dtype=resolve_amp_dtype(device))
     return nullcontext()
 
 
@@ -129,8 +137,13 @@ def prepare_query_rewrites(
     rewrite_cfg: Dict[str, Any],
     seed: int,
     val_ratio: float,
+    val_samples_by_domain: Optional[Dict[str, List[ConversationalTurnSample]]] = None,
 ) -> Dict[str, Dict[str, str]]:
-    """Restituisce una cache per dominio e genera solo le riscritture mancanti."""
+    """Restituisce una cache per dominio e genera solo le riscritture mancanti.
+
+    Le riscritture coprono sia i campioni di training sia quelli di validation
+    interna, così la validazione vede la stessa distribuzione di query del training.
+    """
     cache_root = Path(paths_cfg.get("query_rewrites_cache_dir", "data/cache/query_rewrites/subtrack_2a"))
     cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -144,6 +157,9 @@ def prepare_query_rewrites(
 
     for domain in domains:
         train_samples = train_samples_by_domain[domain]
+        val_samples = (val_samples_by_domain or {}).get(domain, [])
+        # Training + validation interna (nessun qrels coinvolto nella riscrittura).
+        samples_to_rewrite = list(train_samples) + list(val_samples)
         cache_path = cache_root / f"{safe_component(domain)}_{seed_tag}_{cache_tag}.json"
 
         if cache_path.exists() and not overwrite:
@@ -151,14 +167,14 @@ def prepare_query_rewrites(
         else:
             existing = {}
 
-        missing = [sample for sample in train_samples if sample.topic_id not in existing]
+        missing = [sample for sample in samples_to_rewrite if sample.topic_id not in existing]
         if overwrite:
-            missing = list(train_samples)
+            missing = list(samples_to_rewrite)
             existing = {}
 
         logger.info(
-            f"[REWRITE/{domain}] train samples={len(train_samples)} | "
-            f"cached={len(train_samples) - len(missing)} | missing={len(missing)}"
+            f"[REWRITE/{domain}] train={len(train_samples)} | val={len(val_samples)} | "
+            f"cached={len(samples_to_rewrite) - len(missing)} | missing={len(missing)}"
         )
 
         if missing:
@@ -181,7 +197,7 @@ def prepare_query_rewrites(
                 )
 
             metadata = {
-                "purpose": "subtrack_2a_training_query_rewrites",
+                "purpose": "subtrack_2a_train_and_internal_validation_query_rewrites",
                 "domain": domain,
                 "source_split": "benchmark_train.json",
                 "internal_train_seed": seed,
@@ -204,21 +220,19 @@ def prepare_query_rewrites(
             checkpoint_every = int(
                 rewrite_cfg.get("checkpoint_every", 8)
             )
-            updated = rewriter.rewrite_batch(
+            updated = rewriter.rewrite_samples(
                 missing,
                 existing=existing,
                 overwrite=False,
-                batch_size=int(rewrite_cfg.get("batch_size", 4)),
                 progress_desc=f"Rewrite [{domain}]",
                 checkpoint_every=checkpoint_every,
                 checkpoint_callback=persist_rewrite_checkpoint,
             )
-
             save_query_rewrites(cache_path, updated, metadata=metadata)
             existing = updated
             logger.info("[REWRITE/%s] saved %d rewrites to %s", domain, len(existing), cache_path)
 
-        missing_after = [sample.topic_id for sample in train_samples if not existing.get(sample.topic_id, "").strip()]
+        missing_after = [sample.topic_id for sample in samples_to_rewrite if not existing.get(sample.topic_id, "").strip()]
         if missing_after:
             raise RuntimeError(
                 f"Cache riscritture incompleta per {domain}: {len(missing_after)} query mancanti."
@@ -322,7 +336,12 @@ def evaluate_dense_validation_per_domain(
         run: Dict[str, List[Tuple[str, float]]] = {}
         for start in range(0, len(samples), eval_batch_size):
             batch_samples = samples[start:start + eval_batch_size]
-            batch_queries = [sample.contextual_query for sample in batch_samples]
+            # Usa la query riscritta se disponibile (query_mode reasoned/alternate),
+            # altrimenti ripiega sulla query contestualizzata.
+            batch_queries = [
+                (sample.reasoned_query if (sample.reasoned_query or "").strip() else sample.contextual_query)
+                for sample in batch_samples
+            ]
             encoded = tokenizer(
                 batch_queries,
                 padding=True,
@@ -430,7 +449,8 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
 
     logger.info("=" * 88)
     logger.info("RETECO SUB-TRACK 2a — QUERY REASONING + QWEN3 EMBEDDING")
-    logger.info("Device=%s | AMP FP16=%s | seed=%d", device, use_amp, seed)
+    amp_dtype_name = str(resolve_amp_dtype(device)).replace("torch.", "") if use_amp else "disabled"
+    logger.info("Device=%s | AMP=%s (dtype=%s) | seed=%d", device, use_amp, amp_dtype_name, seed)
 
     requested_domains = domains_cfg.get("active_domains", "all")
     domains = list(TRACK2_DOMAINS) if requested_domains == "all" else list(requested_domains)
@@ -536,7 +556,7 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
         )
 
     # ----------------------------------------------------------------------
-    # Query rewriting cache (only train portion; query rewriting never sees qrels)
+    # Query rewriting cache (train + validation interna; query rewriting never sees qrels)
     # ----------------------------------------------------------------------
     rewrites_by_domain: Dict[str, Dict[str, str]] = {}
     if query_mode in {"reasoned", "alternate"}:
@@ -545,6 +565,7 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
         rewrites_by_domain = prepare_query_rewrites(
             domains=domains,
             train_samples_by_domain=train_samples_by_domain,
+            val_samples_by_domain=val_samples_by_domain,
             formatter=raw_formatter,
             paths_cfg=paths_cfg,
             rewrite_cfg=rewrite_cfg,
@@ -590,7 +611,7 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
 
         if query_mode in {"reasoned", "alternate"}:
             rewrite_map = rewrites_by_domain[domain]
-            for sample in train_samples:
+            for sample in train_samples + val_samples_by_domain[domain]:
                 raw_rewrite = rewrite_map.get(sample.topic_id, "")
                 sample.reasoned_query = encoder_formatter.format_rewritten(raw_rewrite) if raw_rewrite else ""
 
@@ -746,6 +767,7 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
         grad_norm_values: List[float] = []
         domain_loss: Dict[str, List[float]] = collections.defaultdict(list)
         non_finite_batches = 0
+        skipped_optimizer_steps = 0
         optimizer.zero_grad(set_to_none=True)
 
         progress = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{epochs}")
@@ -807,15 +829,25 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
                     scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, max_grad_norm)
                 grad_norm_value = float(grad_norm.detach().float().item() if torch.is_tensor(grad_norm) else grad_norm)
-                grad_norm_values.append(grad_norm_value)
+                if math.isfinite(grad_norm_value):
+                    grad_norm_values.append(grad_norm_value)
+
                 if scaler is not None:
+                    scale_before = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
+                    scale_after = scaler.get_scale()
+                    if scale_before <= scale_after:
+                        scheduler.step()
+                        optimizer_step += 1
+                    else:
+                        skipped_optimizer_steps += 1
                 else:
                     optimizer.step()
+                    scheduler.step()
+                    optimizer_step += 1
+
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                optimizer_step += 1
 
             global_step += 1
             progress.set_postfix(
@@ -859,7 +891,12 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
             float(np.mean(grad_norm_values)) if grad_norm_values else 0.0,
             epoch_seconds,
         )
-        logger.info("Domain training loss: %s", {domain: round(float(np.mean(values)), 5) for domain, values in domain_loss.items() if values})
+        if skipped_optimizer_steps:
+            logger.warning(
+                "GradScaler ha saltato %d optimizer step per gradienti non finiti (scheduler non avanzato).",
+                skipped_optimizer_steps,
+            )
+        logger.info("Domain training loss: %s",{domain: round(float(np.mean(values)), 5) for domain, values in domain_loss.items() if values})
 
         # ------------------------------------------------------------------
         # Validation: dense retrieval on internal conversation-level holdout.
@@ -906,6 +943,7 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
                 "global_step": global_step,
                 "epoch_seconds": epoch_seconds,
                 "non_finite_batches": non_finite_batches,
+                "skipped_optimizer_steps": skipped_optimizer_steps,
             },
             "validation": validation,
             "model_selection": {
