@@ -1,7 +1,7 @@
 general:
   seed: 42
   device: "auto"                   # auto | cuda | mps | cpu
-  mixed_precision: true            # AMP su CUDA (BF16 se supportato, altrimenti FP16); disabilitato altrove
+  mixed_precision: true            # BF16 se supportato dalla GPU, altrimenti FP16
   run_tag: "qwen3_reasoning_hybrid_v1"
   logging_level: "INFO"
 
@@ -33,6 +33,7 @@ data:
   hard_negative_pool_size: 40
   negative_sampling_strategy: "bm25_hard"
 
+  # Split interno per conversazione, ricavato esclusivamente da benchmark_train.
   val_ratio: 0.15
 
   # contextual | reasoned | alternate. Alternate cambia query per epoca,
@@ -50,7 +51,8 @@ query_rewriting:
   max_new_tokens: 64
   max_input_tokens: 4096
   max_history_tokens: 3000
-  checkpoint_every: 8             # salva la cache progressiva ogni 8 query generate (~ogni 2 batch)
+  # Salva le riscritture ogni N query completate per poter riprendere dopo stop.
+  checkpoint_every: 8
   overwrite_cache: false
   # Cambiare il tag quando si cambia prompt o impostazione del generatore.
   cache_tag: "qwen3_4b_instruct_2507_rewrite_v1"
@@ -90,12 +92,16 @@ training:
   log_every_n_steps: 20
 
 evaluation:
-  eval_batch_size: 64
+  eval_batch_size: 16
   retrieval_depth: 1000
   cutoff_k: 10
 
   compare_query_modes: true
-  selection_query_mode: "reasoned"  # reasoned | contextual
+  compare_sparse_hybrid: true         # valuta anche BM25 e fusioni RRF
+  selection_query_mode: "reasoned"    # legacy compatibility: reasoned | contextual
+  selection_system: "dense_reasoned"  # sistema che determina il best checkpoint
+  document_eval_batch_size: 32        # batch separato per encoding del corpus; si riduce automaticamente su CUDA OOM
+  rrf_k: 60
 
 sparse:
   k1: 0.9

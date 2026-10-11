@@ -50,8 +50,10 @@ from dataset.dataset import (
     split_conversations_train_val,
 )
 from models.model import ConversationalBiEncoder, ConversationalQueryRewriter
-from retrieval.retrieval import mine_bm25_hard_negatives
-from utils.utils import compute_official_ndcg, load_config, save_json, setup_logger, set_seed
+from retrieval.retrieval import OfficialBM25, _corpus_fingerprint, mine_bm25_hard_negatives
+from utils.utils import (
+    compute_official_ndcg, load_config, reciprocal_rank_fusion, save_json, setup_logger, set_seed,
+)
 
 
 logger = logging.getLogger("RETECO_Train")
@@ -279,152 +281,421 @@ def summarize_training_datasets(
 
 
 # =============================================================================
-# Validation
+# Controlled retrieval comparison: dense contextual/reasoned, BM25 and RRF
 # =============================================================================
 
 @torch.inference_mode()
-def evaluate_dense_validation_per_domain(
+def evaluate_retrieval_comparison_per_domain(
     *,
     model: ConversationalBiEncoder,
     val_samples_by_domain: Dict[str, List[ConversationalTurnSample]],
     corpus_by_domain: Dict[str, Dict[str, str]],
     qrels_by_domain: Dict[str, Dict[str, Dict[str, int]]],
+    raw_contextual_queries_by_domain: Dict[str, Dict[str, str]],
+    raw_reasoned_queries_by_domain: Dict[str, Dict[str, str]],
     tokenizer: Any,
     device: torch.device,
     use_amp: bool,
     max_query_len: int,
     max_doc_len: int,
     eval_batch_size: int = 16,
+    document_eval_batch_size: int = 32,
     retrieval_depth: int = 1000,
+    bm25_k1: float = 0.9,
+    bm25_b: float = 0.4,
+    bm25_index_root: Optional[Path] = None,
+    rrf_k: int = 60,
+    compare_query_modes: bool = True,
+    compare_sparse_hybrid: bool = True,
 ) -> Dict[str, Any]:
-    """Dense validation a macro-media per dominio, con similarity a blocchi."""
+    """Evaluate controlled dense/query and sparse/hybrid comparisons.
+
+    Systems use exactly the same validation topics, corpus and qrels:
+      - dense_contextual: dense encoder + contextual query;
+      - dense_reasoned: dense encoder + rewritten self-contained query;
+      - bm25_contextual / bm25_reasoned: native Lucene BM25 on unprefixed text;
+      - rrf_contextual: dense_contextual + bm25_contextual;
+      - rrf_reasoned: dense_reasoned + bm25_reasoned;
+      - rrf_reasoned_dense_bm25_contextual: recommended hybrid, preserving
+        lexical evidence from the original conversational query.
+
+    Document embeddings are computed once per domain and reused across both
+    dense query variants. BM25 reuses the persistent Lucene index created by
+    the hard-negative miner whenever that index is present.
+    """
+    if eval_batch_size <= 0 or document_eval_batch_size <= 0:
+        raise ValueError("eval_batch_size e document_eval_batch_size devono essere > 0.")
+    if retrieval_depth <= 0:
+        raise ValueError("retrieval_depth deve essere > 0.")
+
     model.eval()
-    per_domain: Dict[str, Dict[str, Any]] = {}
+    per_domain_comparison: Dict[str, Dict[str, Dict[str, float]]] = {}
+    valid_qrels_by_domain: Dict[str, Dict[str, Dict[str, int]]] = {}
 
     for domain, samples in val_samples_by_domain.items():
         if not samples:
             continue
+
         corpus = corpus_by_domain[domain]
         qrels = qrels_by_domain.get(domain, {})
         doc_ids = list(corpus.keys())
         doc_texts = [corpus[doc_id] for doc_id in doc_ids]
-        logger.info("[VAL/%s] %d queries | %d documents", domain, len(samples), len(doc_texts))
+        corpus_id_set = set(doc_ids)
 
-        corpus_chunks: List[torch.Tensor] = []
-        for start in range(0, len(doc_texts), eval_batch_size):
-            encoded = tokenizer(
-                doc_texts[start:start + eval_batch_size],
-                padding=True,
-                truncation=True,
-                max_length=max_doc_len,
-                return_tensors="pt",
+        logger.info(
+            "[VAL/%s] topics=%d | documents=%d | systems=dense/BM25/RRF",
+            domain, len(samples), len(doc_texts),
+        )
+
+        # Use one and the same qrels subset for every system. Fallback to the
+        # benchmark's supplied gold IDs only when qrels has no positive judgment
+        # for a topic; report this count for transparent diagnostics.
+        valid_qrels: Dict[str, Dict[str, int]] = {}
+        qrels_fallback_topics = 0
+        for sample in samples:
+            judged = {
+                str(doc_id): int(rel)
+                for doc_id, rel in qrels.get(sample.topic_id, {}).items()
+                if str(doc_id) in corpus_id_set and int(rel) > 0
+            }
+            if not judged:
+                fallback = {
+                    str(doc_id): 1
+                    for doc_id in sample.gold_doc_ids
+                    if str(doc_id) in corpus_id_set
+                }
+                if fallback:
+                    judged = fallback
+                    qrels_fallback_topics += 1
+            if judged:
+                valid_qrels[sample.topic_id] = judged
+        if not valid_qrels:
+            raise RuntimeError(f"Nessun qrels positivo valido per la validation di {domain}.")
+        if qrels_fallback_topics:
+            logger.warning(
+                "[VAL/%s] qrels fallback used for %d/%d topics; all systems use the same qrels.",
+                domain, qrels_fallback_topics, len(samples),
             )
-            encoded = {key: value.to(device) for key, value in encoded.items()}
-            with autocast_context(device, use_amp):
-                embeddings = model.encode(
-                    input_ids=encoded["input_ids"],
-                    attention_mask=encoded["attention_mask"],
-                    token_type_ids=encoded.get("token_type_ids"),
+        valid_qrels_by_domain[domain] = valid_qrels
+
+        # ------------------------------------------------------------------
+        # 1. Encode the complete official corpus only once for this domain.
+        #    Increase document batch size independently of query batch size;
+        #    automatically retry smaller batches on CUDA OOM.
+        # ------------------------------------------------------------------
+        active_doc_batch_size = int(document_eval_batch_size)
+        corpus_embeddings: Optional[torch.Tensor] = None
+        while True:
+            corpus_chunks: List[torch.Tensor] = []
+            try:
+                for doc_start in tqdm(
+                    range(0, len(doc_texts), active_doc_batch_size),
+                    total=(len(doc_texts) + active_doc_batch_size - 1) // active_doc_batch_size,
+                    desc=f"Encode docs [{domain}]",
+                    unit="batch",
+                    leave=False,
+                ):
+                    batch_texts = doc_texts[doc_start:doc_start + active_doc_batch_size]
+                    encoded = tokenizer(
+                        batch_texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=max_doc_len,
+                        return_tensors="pt",
+                    )
+                    encoded = {key: value.to(device) for key, value in encoded.items()}
+                    with autocast_context(device, use_amp):
+                        embeddings = model.encode(
+                            input_ids=encoded["input_ids"],
+                            attention_mask=encoded["attention_mask"],
+                            token_type_ids=encoded.get("token_type_ids"),
+                        )
+                    corpus_chunks.append(embeddings.float().cpu())
+                    del encoded, embeddings
+                corpus_embeddings = torch.cat(corpus_chunks, dim=0)
+                break
+            except RuntimeError as exc:
+                error_text = str(exc).lower()
+                is_cuda_oom = device.type == "cuda" and (
+                    "out of memory" in error_text or "cuda error: memory" in error_text
                 )
-            corpus_chunks.append(embeddings.float().cpu())
-            del encoded, embeddings
+                corpus_chunks.clear()
+                corpus_embeddings = None
+                # Drop the last partially processed batch tensors before retrying.
+                if "encoded" in locals():
+                    encoded = None
+                if "embeddings" in locals():
+                    embeddings = None
+                clear_device_cache(device)
+                if not is_cuda_oom or active_doc_batch_size <= 4:
+                    raise
+                old_size = active_doc_batch_size
+                active_doc_batch_size = max(4, active_doc_batch_size // 2)
+                logger.warning(
+                    "[VAL/%s] CUDA OOM encoding corpus; retrying with document batch size %d (was %d).",
+                    domain, active_doc_batch_size, old_size,
+                )
 
-        corpus_embeddings = torch.cat(corpus_chunks, dim=0)
-        del corpus_chunks
-        clear_device_cache(device)
+        assert corpus_embeddings is not None
+        logger.info(
+            "[VAL/%s] corpus embeddings ready: shape=%s | document_batch_size=%d",
+            domain, tuple(corpus_embeddings.shape), active_doc_batch_size,
+        )
 
-        run: Dict[str, List[Tuple[str, float]]] = {}
-        for start in range(0, len(samples), eval_batch_size):
-            batch_samples = samples[start:start + eval_batch_size]
-            # Usa la query riscritta se disponibile (query_mode reasoned/alternate),
-            # altrimenti ripiega sulla query contestualizzata.
-            batch_queries = [
-                (sample.reasoned_query if (sample.reasoned_query or "").strip() else sample.contextual_query)
-                for sample in batch_samples
-            ]
-            encoded = tokenizer(
-                batch_queries,
-                padding=True,
-                truncation=True,
-                max_length=max_query_len,
-                return_tensors="pt",
+        depth = min(int(retrieval_depth), len(doc_ids))
+
+        def dense_run(query_texts: List[str], mode_name: str) -> Dict[str, List[Tuple[str, float]]]:
+            run: Dict[str, List[Tuple[str, float]]] = {}
+            for query_start in range(0, len(samples), eval_batch_size):
+                batch_samples = samples[query_start:query_start + eval_batch_size]
+                batch_queries = query_texts[query_start:query_start + eval_batch_size]
+                encoded = tokenizer(
+                    batch_queries,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_query_len,
+                    return_tensors="pt",
+                )
+                encoded = {key: value.to(device) for key, value in encoded.items()}
+                with autocast_context(device, use_amp):
+                    query_embeddings = model.encode(
+                        input_ids=encoded["input_ids"],
+                        attention_mask=encoded["attention_mask"],
+                        token_type_ids=encoded.get("token_type_ids"),
+                    )
+                query_embeddings = query_embeddings.float().cpu()
+                scores = query_embeddings @ corpus_embeddings.T
+                top_scores, top_indices = torch.topk(scores, k=depth, dim=1)
+                for row, sample in enumerate(batch_samples):
+                    run[sample.topic_id] = [
+                        (doc_ids[int(top_indices[row, col])], float(top_scores[row, col]))
+                        for col in range(depth)
+                    ]
+                del encoded, query_embeddings, scores, top_scores, top_indices
+            logger.info("[VAL/%s/%s] encoded %d queries", domain, mode_name, len(run))
+            return run
+
+        contextual_queries = [sample.contextual_query for sample in samples]
+        missing_reasoned = [sample.topic_id for sample in samples if not (sample.reasoned_query or "").strip()]
+        if compare_query_modes and missing_reasoned:
+            raise RuntimeError(
+                f"Confronto contextual/reasoned non valido per {domain}: "
+                f"mancano {len(missing_reasoned)} query riscritte (es. {missing_reasoned[:3]})."
             )
-            encoded = {key: value.to(device) for key, value in encoded.items()}
-            with autocast_context(device, use_amp):
-                query_embeddings = model.encode(
-                    input_ids=encoded["input_ids"],
-                    attention_mask=encoded["attention_mask"],
-                    token_type_ids=encoded.get("token_type_ids"),
-                )
-            query_embeddings = query_embeddings.float().cpu()
-            scores = query_embeddings @ corpus_embeddings.T
-            k = min(int(retrieval_depth), len(doc_ids))
-            top_scores, top_indices = torch.topk(scores, k=k, dim=1)
-            for row, sample in enumerate(batch_samples):
-                run[sample.topic_id] = [
-                    (doc_ids[int(top_indices[row, col])], float(top_scores[row, col]))
-                    for col in range(k)
-                ]
-            del encoded, query_embeddings, scores, top_scores, top_indices
+        reasoned_queries = [
+            (sample.reasoned_query or sample.contextual_query)
+            for sample in samples
+        ]
+
+        dense_contextual = dense_run(contextual_queries, "dense_contextual")
+        dense_reasoned = (
+            dense_run(reasoned_queries, "dense_reasoned")
+            if compare_query_modes else dense_contextual
+        )
 
         del corpus_embeddings
         clear_device_cache(device)
 
-        corpus_id_set = set(doc_ids)
-        valid_qrels: Dict[str, Dict[str, int]] = {}
-        for sample in samples:
-            filtered = {
-                doc_id: int(rel)
-                for doc_id, rel in qrels.get(sample.topic_id, {}).items()
-                if doc_id in corpus_id_set and int(rel) > 0
-            }
-            # Fallback diagnostico soltanto: usa i gold disponibili nel sample.
-            if not filtered:
-                filtered = {doc_id: 1 for doc_id in sample.gold_doc_ids if doc_id in corpus_id_set}
-            if filtered:
-                valid_qrels[sample.topic_id] = filtered
+        # ------------------------------------------------------------------
+        # 2. Native Lucene BM25 on the raw, unprefixed contextual and rewritten
+        #    query. The persistent corpus index is shared with hard-negative
+        #    mining, so validation does not rebuild it on every epoch.
+        # ------------------------------------------------------------------
+        raw_context_map = raw_contextual_queries_by_domain.get(domain, {})
+        raw_rewrite_map = raw_reasoned_queries_by_domain.get(domain, {})
+        bm25_contextual: Dict[str, List[Tuple[str, float]]] = {}
+        bm25_reasoned: Dict[str, List[Tuple[str, float]]] = {}
+        corpus_fp = _corpus_fingerprint(corpus)
+        index_dir = (Path(bm25_index_root) / corpus_fp) if bm25_index_root is not None else None
+        with OfficialBM25(
+            corpus=corpus,
+            k1=bm25_k1,
+            b=bm25_b,
+            index_dir=index_dir,
+        ) as bm25:
+            for sample in tqdm(
+                samples,
+                desc=f"BM25 validation [{domain}]",
+                unit="query",
+                leave=False,
+            ):
+                raw_context = raw_context_map.get(sample.topic_id, "")
+                if not raw_context:
+                    raise RuntimeError(
+                        f"Query contestualizzata raw mancante per {domain}/{sample.topic_id}; "
+                        "non usare la query con prefisso Qwen per BM25."
+                    )
+                bm25_contextual[sample.topic_id] = bm25.search_one(
+                    raw_context, top_k=depth
+                )
+                if compare_query_modes:
+                    raw_reasoned = str(raw_rewrite_map.get(sample.topic_id, "") or "").strip()
+                    if not raw_reasoned:
+                        raise RuntimeError(
+                            f"Riscrittura raw mancante per BM25: {domain}/{sample.topic_id}."
+                        )
+                    bm25_reasoned[sample.topic_id] = bm25.search_one(
+                        raw_reasoned, top_k=depth
+                    )
 
-        trec_run = {topic: {doc_id: score for doc_id, score in ranking} for topic, ranking in run.items()}
-        official = compute_official_ndcg(valid_qrels, trec_run, cutoff=10)
-
-        recalls: Dict[int, List[float]] = {10: [], 50: [], 100: [], 500: [], 1000: []}
-        reciprocal_ranks: List[float] = []
-        for topic_id, gold_map in valid_qrels.items():
-            ranked_ids = [doc_id for doc_id, _ in run.get(topic_id, [])]
-            golds = set(gold_map)
-            for cutoff in recalls:
-                recalls[cutoff].append(len(set(ranked_ids[:cutoff]) & golds) / max(1, len(golds)))
-            reciprocal_ranks.append(next((1.0 / rank for rank, doc_id in enumerate(ranked_ids, start=1) if doc_id in golds), 0.0))
-
-        result: Dict[str, Any] = {
-            "num_topics": len(valid_qrels),
-            "num_documents": len(doc_ids),
-            "nDCG@10": float(official.get("ndcg_cut_10", 0.0)),
-            "MRR": float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0,
+        systems_runs: Dict[str, Dict[str, List[Tuple[str, float]]]] = {
+            "dense_contextual": dense_contextual,
+            "dense_reasoned": dense_reasoned,
+            "bm25_contextual": bm25_contextual,
         }
-        for cutoff, values in recalls.items():
-            result[f"Recall@{cutoff}"] = float(np.mean(values)) if values else 0.0
-        per_domain[domain] = result
+        if compare_query_modes:
+            systems_runs["bm25_reasoned"] = bm25_reasoned
+        if compare_sparse_hybrid:
+            systems_runs["rrf_contextual"] = reciprocal_rank_fusion(
+                [dense_contextual, bm25_contextual], k=rrf_k, top_n=depth
+            )
+            if compare_query_modes:
+                systems_runs["rrf_reasoned"] = reciprocal_rank_fusion(
+                    [dense_reasoned, bm25_reasoned], k=rrf_k, top_n=depth
+                )
+                # Proposed system: semantically rewritten dense query plus the
+                # original-context lexical ranking, preserving exact user terms.
+                systems_runs["rrf_reasoned_dense_bm25_contextual"] = reciprocal_rank_fusion(
+                    [dense_reasoned, bm25_contextual], k=rrf_k, top_n=depth
+                )
+
+        # ------------------------------------------------------------------
+        # 3. Compute every metric against the exact same qrels topics.
+        # ------------------------------------------------------------------
+        def score_run(run: Dict[str, List[Tuple[str, float]]]) -> Dict[str, float]:
+            score_map = {
+                topic_id: {doc_id: float(score) for doc_id, score in ranking}
+                for topic_id, ranking in run.items()
+            }
+            ndcg = compute_official_ndcg(valid_qrels, score_map, cutoff=10).get("ndcg_cut_10", 0.0)
+            recalls: Dict[int, List[float]] = {10: [], 50: [], 100: [], 1000: []}
+            reciprocal_ranks: List[float] = []
+            for topic_id, gold_map in valid_qrels.items():
+                ranked_ids = [doc_id for doc_id, _ in run.get(topic_id, [])]
+                gold_ids = set(gold_map)
+                for cutoff in recalls:
+                    hits = len(set(ranked_ids[:cutoff]).intersection(gold_ids))
+                    recalls[cutoff].append(hits / max(1, len(gold_ids)))
+                rr = next(
+                    (1.0 / rank for rank, doc_id in enumerate(ranked_ids, start=1) if doc_id in gold_ids),
+                    0.0,
+                )
+                reciprocal_ranks.append(rr)
+            result = {
+                "nDCG@10": float(ndcg),
+                "MRR": float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0,
+                "num_topics": int(len(valid_qrels)),
+                "num_documents": int(len(doc_ids)),
+                "qrels_fallback_topics": int(qrels_fallback_topics),
+            }
+            for cutoff, values in recalls.items():
+                result[f"Recall@{cutoff}"] = float(np.mean(values)) if values else 0.0
+            return result
+
+        domain_metrics = {
+            system_name: score_run(run)
+            for system_name, run in systems_runs.items()
+        }
+        per_domain_comparison[domain] = domain_metrics
+
+        def metric(system: str, name: str = "nDCG@10") -> float:
+            return float(domain_metrics.get(system, {}).get(name, 0.0))
+
         logger.info(
-            "[VAL/%s] nDCG@10=%.4f | R@10=%.4f | R@100=%.4f | R@1000=%.4f | MRR=%.4f",
+            "[VAL-COMPARE/%s] dense_ctx=%.4f | dense_reasoned=%.4f | "
+            "BM25_ctx=%.4f | BM25_reasoned=%.4f | RRF_ctx=%.4f | "
+            "RRF_reasoned=%.4f | RRF_reasoned+BM25_ctx=%.4f",
             domain,
-            result["nDCG@10"],
-            result["Recall@10"],
-            result["Recall@100"],
-            result["Recall@1000"],
-            result["MRR"],
+            metric("dense_contextual"),
+            metric("dense_reasoned"),
+            metric("bm25_contextual"),
+            metric("bm25_reasoned"),
+            metric("rrf_contextual"),
+            metric("rrf_reasoned"),
+            metric("rrf_reasoned_dense_bm25_contextual"),
+        )
+        logger.info(
+            "[VAL-RECALL/%s] dense_ctx R@10/100/1000=%.4f/%.4f/%.4f | "
+            "dense_reasoned=%.4f/%.4f/%.4f | BM25_ctx=%.4f/%.4f/%.4f",
+            domain,
+            metric("dense_contextual", "Recall@10"),
+            metric("dense_contextual", "Recall@100"),
+            metric("dense_contextual", "Recall@1000"),
+            metric("dense_reasoned", "Recall@10"),
+            metric("dense_reasoned", "Recall@100"),
+            metric("dense_reasoned", "Recall@1000"),
+            metric("bm25_contextual", "Recall@10"),
+            metric("bm25_contextual", "Recall@100"),
+            metric("bm25_contextual", "Recall@1000"),
         )
 
-    if not per_domain:
-        return {"per_domain": {}, "macro_average": {}}
+    if not per_domain_comparison:
+        return {"systems": {}, "per_domain": {}, "macro_deltas": {}}
 
-    metric_names = ["nDCG@10", "Recall@10", "Recall@50", "Recall@100", "Recall@500", "Recall@1000", "MRR"]
-    macro: Dict[str, float] = {}
-    for name in metric_names:
-        values = [metrics[name] for metrics in per_domain.values()]
-        macro[name] = float(np.mean(values))
-        macro[f"{name}_std"] = float(np.std(values))
-    return {"per_domain": per_domain, "macro_average": macro}
+    # Macro-average over domains (each domain gets the same weight), matching
+    # the project's previous validation summary convention.
+    system_names = sorted({name for values in per_domain_comparison.values() for name in values})
+    metric_names = ["nDCG@10", "Recall@10", "Recall@50", "Recall@100", "Recall@1000", "MRR"]
+    systems_summary: Dict[str, Any] = {}
+    for system_name in system_names:
+        system_domains = {
+            domain: domain_metrics[system_name]
+            for domain, domain_metrics in per_domain_comparison.items()
+            if system_name in domain_metrics
+        }
+        macro: Dict[str, float] = {}
+        for metric_name in metric_names:
+            values = [float(metrics[metric_name]) for metrics in system_domains.values()]
+            macro[metric_name] = float(np.mean(values)) if values else 0.0
+            macro[f"{metric_name}_std"] = float(np.std(values)) if values else 0.0
+        systems_summary[system_name] = {
+            "per_domain": system_domains,
+            "macro_average": macro,
+        }
+        logger.info(
+            "[VAL-MACRO/%s] nDCG@10=%.5f | R@10=%.5f | R@100=%.5f | R@1000=%.5f | MRR=%.5f | domain_std=%.5f",
+            system_name,
+            macro["nDCG@10"], macro["Recall@10"], macro["Recall@100"],
+            macro["Recall@1000"], macro["MRR"], macro["nDCG@10_std"],
+        )
+
+    macro_deltas: Dict[str, Dict[str, float]] = {}
+    delta_pairs = [
+        ("dense_reasoned_minus_contextual", "dense_reasoned", "dense_contextual"),
+        ("rrf_reasoned_plus_bm25_contextual_minus_dense_reasoned", "rrf_reasoned_dense_bm25_contextual", "dense_reasoned"),
+        ("rrf_reasoned_plus_bm25_contextual_minus_bm25_contextual", "rrf_reasoned_dense_bm25_contextual", "bm25_contextual"),
+    ]
+    for delta_name, left, right in delta_pairs:
+        if left not in systems_summary or right not in systems_summary:
+            continue
+        macro_deltas[delta_name] = {
+            metric_name: float(
+                systems_summary[left]["macro_average"][metric_name]
+                - systems_summary[right]["macro_average"][metric_name]
+            )
+            for metric_name in metric_names
+        }
+        logger.info(
+            "[VAL-DELTA/%s] nDCG@10=%+.5f | R@10=%+.5f | R@100=%+.5f",
+            delta_name,
+            macro_deltas[delta_name]["nDCG@10"],
+            macro_deltas[delta_name]["Recall@10"],
+            macro_deltas[delta_name]["Recall@100"],
+        )
+
+    return {
+        "systems": systems_summary,
+        "per_domain": per_domain_comparison,
+        "macro_deltas": macro_deltas,
+        "settings": {
+            "retrieval_depth": int(retrieval_depth),
+            "rrf_k": int(rrf_k),
+            "bm25_k1": float(bm25_k1),
+            "bm25_b": float(bm25_b),
+            "document_eval_batch_size_requested": int(document_eval_batch_size),
+            "qrels_policy": "same filtered qrels for all systems; benchmark gold fallback only if no positive qrels",
+        },
+    }
 
 
 # =============================================================================
@@ -517,6 +788,8 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
     val_samples_by_domain: Dict[str, List[ConversationalTurnSample]] = {}
     corpus_by_domain: Dict[str, Dict[str, str]] = {}
     val_qrels_by_domain: Dict[str, Dict[str, Dict[str, int]]] = {}
+    # Keep unprefixed contextual queries for BM25 evaluation before encoder instruction is added.
+    raw_contextual_queries_by_domain: Dict[str, Dict[str, str]] = {}
 
     logger.info("Loading official RETECO training split from %s", base_data_dir)
     for domain in domains:
@@ -531,6 +804,10 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
             val_ratio=val_ratio,
             seed=seed,
         )
+        # Snapshot the raw, unprefixed formatter output for the BM25 comparison.
+        raw_contextual_queries_by_domain[domain] = {
+            sample.topic_id: sample.contextual_query for sample in val_samples
+        }
         if not train_samples or not val_samples:
             raise ValueError(
                 f"Split interno vuoto per {domain}: train={len(train_samples)}, val={len(val_samples)}. "
@@ -901,31 +1178,53 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
         # ------------------------------------------------------------------
         # Validation: dense retrieval on internal conversation-level holdout.
         # ------------------------------------------------------------------
-        validation = evaluate_dense_validation_per_domain(
+        sparse_eval_cfg = config.get("sparse", {})
+        validation = evaluate_retrieval_comparison_per_domain(
             model=model,
             val_samples_by_domain=val_samples_by_domain,
             corpus_by_domain=corpus_by_domain,
             qrels_by_domain=val_qrels_by_domain,
+            raw_contextual_queries_by_domain=raw_contextual_queries_by_domain,
+            raw_reasoned_queries_by_domain=rewrites_by_domain,
             tokenizer=tokenizer,
             device=device,
             use_amp=use_amp,
             max_query_len=max_query_length,
             max_doc_len=max_doc_length,
             eval_batch_size=int(evaluation_cfg.get("eval_batch_size", 16)),
+            document_eval_batch_size=int(evaluation_cfg.get("document_eval_batch_size", 32)),
             retrieval_depth=int(evaluation_cfg.get("retrieval_depth", 1000)),
+            bm25_k1=float(sparse_eval_cfg.get("k1", 0.9)),
+            bm25_b=float(sparse_eval_cfg.get("b", 0.4)),
+            bm25_index_root=hard_negative_cache_dir / "lucene_indexes",
+            rrf_k=int(evaluation_cfg.get("rrf_k", 60)),
+            compare_query_modes=bool(evaluation_cfg.get("compare_query_modes", True)),
+            compare_sparse_hybrid=bool(evaluation_cfg.get("compare_sparse_hybrid", True)),
         )
-        macro = validation.get("macro_average", {})
+        systems = validation.get("systems", {})
+        if not systems:
+            raise RuntimeError("La valutazione non ha restituito sistemi validi.")
+        default_selection_system = "dense_reasoned" if query_mode in {"reasoned", "alternate"} else "dense_contextual"
+        selection_system = str(evaluation_cfg.get("selection_system", default_selection_system)).strip()
+        if selection_system not in systems:
+            raise ValueError(
+                f"evaluation.selection_system={selection_system!r} non è disponibile. "
+                f"Sistemi disponibili: {sorted(systems)}"
+            )
+        selected_summary = systems[selection_system]
+        macro = selected_summary.get("macro_average", {})
         val_ndcg = float(macro.get("nDCG@10", 0.0))
         logger.info(
-            "VALIDATION MACRO | nDCG@10=%.5f | R@10=%.5f | R@50=%.5f | R@100=%.5f | R@1000=%.5f | MRR=%.5f | domain_std=%.5f",
+            "CHECKPOINT SELECTION SYSTEM=%s | nDCG@10=%.5f | R@10=%.5f | R@100=%.5f | R@1000=%.5f | MRR=%.5f",
+            selection_system,
             val_ndcg,
             float(macro.get("Recall@10", 0.0)),
-            float(macro.get("Recall@50", 0.0)),
             float(macro.get("Recall@100", 0.0)),
             float(macro.get("Recall@1000", 0.0)),
             float(macro.get("MRR", 0.0)),
-            float(macro.get("nDCG@10_std", 0.0)),
         )
+        # Dedicated comparison artifact makes the results easy to share/inspect.
+        save_json(validation, output_dir / f"retrieval_comparison_epoch_{epoch + 1}.json")
 
         improved = val_ndcg > best_score
         epoch_record = {
@@ -1022,6 +1321,14 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
             "lora_enabled": bool(lora_cfg.get("enabled", False)),
             "gradient_checkpointing": gradient_checkpointing,
             "parameters": parameter_stats,
+        },
+        "evaluation": {
+            "selection_system": selection_system if "selection_system" in locals() else str(evaluation_cfg.get("selection_system", "dense_reasoned")),
+            "compare_query_modes": bool(evaluation_cfg.get("compare_query_modes", True)),
+            "compare_sparse_hybrid": bool(evaluation_cfg.get("compare_sparse_hybrid", True)),
+            "retrieval_depth": int(evaluation_cfg.get("retrieval_depth", 1000)),
+            "document_eval_batch_size": int(evaluation_cfg.get("document_eval_batch_size", 32)),
+            "rrf_k": int(evaluation_cfg.get("rrf_k", 60)),
         },
         "query_rewriting": {
             "enabled": bool(rewrite_cfg.get("enabled", False)) and query_mode != "contextual",
