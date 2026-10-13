@@ -1176,7 +1176,55 @@ def train_bi_encoder(config: Dict[str, Any]) -> None:
         logger.info("Domain training loss: %s",{domain: round(float(np.mean(values)), 5) for domain, values in domain_loss.items() if values})
 
         # ------------------------------------------------------------------
-        # Validation: dense retrieval on internal conversation-level holdout.
+        # Recovery checkpoint BEFORE the expensive full-corpus validation.
+        # This protects the adapter if validation is interrupted or the cloud
+        # session expires. It is directly loadable by evaluate_retrieval.py.
+        # ------------------------------------------------------------------
+        if bool(training_cfg.get("save_prevalidation_checkpoint", True)):
+            trainable_names = {
+                name for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            }
+            trainable_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in model.state_dict().items()
+                if name in trainable_names
+            }
+            recovery_payload = {
+                "checkpoint_format": "trainable_parameters_only",
+                "checkpoint_stage": "pre_validation_recovery",
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "optimizer_step": optimizer_step,
+                "model_state_dict": trainable_state,
+                "best_score": best_score if math.isfinite(best_score) else None,
+                "model_name": model_name,
+                "model_parameters": parameter_stats,
+                "config": config,
+            }
+            recovery_paths = [
+                checkpoint_dir / f"epoch_{epoch + 1}_prevalidation.pt",
+                checkpoint_dir / "last_epoch_prevalidation.pt",
+            ]
+            for recovery_path in recovery_paths:
+                temporary_path = recovery_path.with_suffix(recovery_path.suffix + ".tmp")
+                try:
+                    torch.save(recovery_payload, temporary_path)
+                    os.replace(temporary_path, recovery_path)
+                except Exception:
+                    try:
+                        temporary_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+            logger.info(
+                "RECOVERY CHECKPOINT SAVED before validation | epoch=%d | path=%s",
+                epoch + 1,
+                recovery_paths[1],
+            )
+
+        # ------------------------------------------------------------------
+        # Validation: controlled dense/BM25/RRF retrieval on internal holdout.
         # ------------------------------------------------------------------
         sparse_eval_cfg = config.get("sparse", {})
         validation = evaluate_retrieval_comparison_per_domain(
