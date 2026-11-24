@@ -340,3 +340,81 @@ indipendente della copertura con il formato pubblicato:
 python subtrack_2b/generate_submission.py --predictions generation_test.jsonl \
   --expected-ids official_topic_ids.txt --output submission_2b.jsonl
 ```
+
+## Pilot di profondità ricorrente
+
+`--recurrent-passes R` applica un layer decoder condiviso (R) volte per
+forward, passando il nuovo stato nascosto al prossimo passaggio. Gli altri
+layer seguono il percorso standard. `--recurrent-layer I` seleziona l'indice
+zero-based. Il default è il layer centrale inferiore. Il backend è il decoder
+Hugging Face Qwen2/Qwen2.5 o Qwen3 denso. Lo stesso wrapper può essere esteso
+verificando il contratto del decoder di un'altra famiglia.
+
+Questa è una prova in inferenza con un checkpoint preaddestrato a profondità
+standard. Un cambiamento di profondità può anche peggiorare le risposte.
+Il pilot lascia il training del 2b e la pipeline 2a disponibili come prima.
+La modalità esplicita usa `use_cache=False` anche con `R=1`, così ogni confronto
+tra profondità usa lo stesso regime di cache. Senza il flag, l'inferenza
+ordinaria continua a usare la KV cache. Il decoding senza cache ricalcola
+il prefisso e può essere lento, soprattutto per risposte lunghe.
+
+### Smoke su MacBook Air M2
+
+Usa Python con PyTorch per Apple Silicon. Installa solo le dipendenze utili
+per questo smoke e lancia dalla radice della repo con il dataset già presente
+in `data/reteco_data`. Il profilo standard usa Qwen2.5-0.5B senza
+quantizzazione. `device: auto` seleziona MPS quando disponibile.
+
+```bash
+python -m pip install 'transformers==4.57.6' 'Jinja2>=3.1' PyYAML numpy tqdm safetensors
+
+python subtrack_2b/inference.py --config subtrack_2b/config/config.yaml \
+  --split internal-val --domain drones --zero-shot --smoke-test \
+  --max-input-tokens 512 --max-new-tokens 32 --skip-text-metrics \
+  --recurrent-passes 2 --output-dir outputs/loop_m2_smoke
+```
+
+Controlla `run.json` per device, layer, numero di passaggi e stato della cache.
+Nel file `internal-val_predictions.jsonl` trovi risposte, token generati,
+tempo per turno e hash degli ID token del prompt. La lunghezza di 32 token
+serve solo al controllo tecnico. Se MPS dà errore, puoi ripetere la prova
+impostando `general.device: cpu` in una copia del YAML.
+
+### Pilot su T4
+
+Il profilo `t4_qwen3_4b.yaml` usa Qwen3-4B-Instruct-2507 in NF4 con
+calcolo FP16. Sul runtime CUDA servono anche `accelerate` e `bitsandbytes`.
+Verifica che `run.json` riporti `device: cuda` e `loaded_in_4bit: true`.
+Per la prima prova su T4 usa il comando dello smoke, il profilo T4 e una
+directory di output nuova. Poi, nello stesso ambiente, esegui il confronto
+appaiato seguente. Se la latenza è eccessiva, riduci il numero di turni per
+tutte le condizioni.
+
+```bash
+cfg=subtrack_2b/config/t4_qwen3_4b.yaml
+
+python subtrack_2b/inference.py --config "$cfg" --split internal-val \
+  --domain drones --max-samples 20 --zero-shot --skip-text-metrics \
+  --max-input-tokens 768 --max-new-tokens 96 \
+  --recurrent-passes 1 --output-dir outputs/loop_t4_r1
+
+for passes in 2 4; do
+  python subtrack_2b/inference.py --config "$cfg" --split internal-val \
+    --domain drones --topic-ids outputs/loop_t4_r1/topic_ids.txt \
+    --zero-shot --skip-text-metrics --max-input-tokens 768 --max-new-tokens 96 \
+    --recurrent-passes "$passes" --output-dir "outputs/loop_t4_r${passes}" || break
+done
+
+python subtrack_2b/evaluate_generation.py prepare \
+  --baseline outputs/loop_t4_r1/internal-val_predictions.jsonl \
+  --candidate outputs/loop_t4_r2/internal-val_predictions.jsonl \
+  --review outputs/loop_t4_review_r2.json --key outputs/loop_t4_review_r2_key.json
+```
+
+Controlla che l'hash del prompt coincida per ciascun turno nel confronto
+sullo stesso checkpoint. Confronta fedeltà, completezza, latenza e numero
+di token generati. I primi 20 turni di `drones` sono un controllo di
+fattibilità. Per lo studio scegli prima un elenco di ID distribuiti per
+dominio e difficoltà, usa la validazione interna per scegliere il layer e
+i passaggi, poi conferma su `dev`. Ripeti le misure di latenza a runtime caldo
+prima di trarre conclusioni sui costi.

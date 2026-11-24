@@ -282,3 +282,50 @@ attesi per la release:
 python subtrack_2a/generate_submission.py --run test_run_E_reasoned.trec \
   --expected-ids official_topic_ids.txt --output submission_2a.trec
 ```
+
+## Pilot di profondità ricorrente nel reranker
+
+Il reranker Qwen usa lo stesso layer ricorrente del 2b. Applica il layer
+centrale inferiore più volte prima di calcolare `logit(yes) - logit(no)`.
+`--recurrent-layer` permette di specificare un indice zero-based.
+La profondità 1 è il reranker standard. Il retriever e gli embedding possono
+essere riutilizzati perché l'opzione agisce solo dopo il recupero.
+
+### T4, validation interna e pool BM25
+
+Esegui dalla radice della repo con i dati RETECO e Java/Pyserini configurati.
+Nella verifica iniziale usa due query; quando la run termina, passa a 10 o 20
+query per dominio mantenendo identiche le impostazioni tra profondità.
+
+```bash
+for passes in 1 2 4; do
+  python subtrack_2a/evaluate_retrieval.py \
+    --config subtrack_2a/config/config.yaml --split internal-val --domains drones \
+    --top-k 20 --batch-size 2 --max-length 512 \
+    --current-query-tokens 128 --document-tokens 256 \
+    --max-queries-per-domain 2 --device cuda --no-score-cache \
+    --recurrent-passes "$passes" --output "outputs/2a_loop_r${passes}.json" || break
+done
+```
+
+Per una prova equivalente sul Mac sostituisci `--device cuda` con
+`--device mps` o `--device cpu`. Il reranker usa FP16 su CUDA e FP32 sugli
+altri dispositivi. L'opzione `--no-score-cache` ricalcola gli score e rende
+confrontabile la latenza. Per le run lunghe senza misure di latenza puoi
+riattivare la cache. Gli score di profondità diverse sono salvati separatamente.
+
+### Pool del retriever già addestrato
+
+Passa `--candidate-run path/al/ranking.trec --split dev` per riordinare i
+candidati di un TREC della pipeline dense o RRF. Il TREC deve coprire i turni
+selezionati per i domini indicati. Se il TREC contiene solo 10 documenti
+per turno, usa `--top-k 10`. Un pool più grande richiede un export più
+profondo. Per il tuning usa `internal-val` e un ranking dello stesso split;
+usa `dev` per confermare la configurazione scelta.
+
+Nei report confronta `reranked.nDCG@10`, `candidate_pool_recall` (al
+`top_k` scelto) e `mean_uncached_query_seconds` per dominio. Verifica che
+`candidate_pool_sha256` coincida tra le condizioni. La latenza misura il
+reranking per query, inclusa la tokenizzazione delle coppie. Per confronti
+di costo ripeti le run a runtime caldo e considera anche la latenza di
+retrieval se vuoi riportare il tempo dell'intera pipeline.

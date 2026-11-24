@@ -17,6 +17,7 @@ Supporto a:
 
 import logging
 from pathlib import Path
+from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -26,6 +27,8 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
 )
+
+from subtrack_2b.models.recurrent_depth import repeat_decoder_layer, resolve_recurrent_layer
 
 logger = logging.getLogger("subtrack_2b")
 
@@ -56,6 +59,9 @@ class ConversationalGenerator(nn.Module):
 
         self.tokenizer: Any = None
         self.model: Any = None
+        self.recurrent_passes: Optional[int] = None
+        self.recurrent_layer_index: Optional[int] = None
+        self.last_output_token_count = 0
 
     # ==========================================================================
     # DEVICE / DTYPE HELPERS
@@ -620,6 +626,13 @@ class ConversationalGenerator(nn.Module):
     # GENERATION
     # ==========================================================================
 
+    def configure_recurrent_depth(self, passes: int, layer_index: Optional[int] = None) -> None:
+        """Enable matched no-cache decoding, including the one-pass control."""
+        if passes < 1:
+            raise ValueError("Il numero di passaggi deve essere almeno 1.")
+        self.recurrent_layer_index, _ = resolve_recurrent_layer(self.model, layer_index)
+        self.recurrent_passes = passes
+
     @torch.inference_mode()
     def generate_single(
         self,
@@ -707,7 +720,7 @@ class ConversationalGenerator(nn.Module):
             "eos_token_id": (
                 self.tokenizer.eos_token_id
             ),
-            "use_cache": True,
+            "use_cache": self.recurrent_passes is None,
         }
 
         if do_sample:
@@ -731,11 +744,16 @@ class ConversationalGenerator(nn.Module):
                 }
             )
 
-        outputs = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **generation_kwargs,
-        )
+        recurrence = nullcontext()
+        if self.recurrent_passes is not None:
+            _, layer = resolve_recurrent_layer(self.model, self.recurrent_layer_index)
+            recurrence = repeat_decoder_layer(layer, self.recurrent_passes)
+        with recurrence:
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **generation_kwargs,
+            )
 
         prompt_len = input_ids.shape[1]
 
@@ -744,6 +762,7 @@ class ConversationalGenerator(nn.Module):
             prompt_len:,
         ]
 
+        self.last_output_token_count = generated_tokens.numel()
         answer = self.tokenizer.decode(
             generated_tokens,
             skip_special_tokens=True,

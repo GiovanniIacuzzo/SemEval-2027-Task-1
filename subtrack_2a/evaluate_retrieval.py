@@ -22,7 +22,9 @@ import json
 import logging
 import math
 import random
+import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
@@ -33,6 +35,12 @@ from tqdm import tqdm
 
 from retrieval.retrieval import OfficialBM25, _corpus_fingerprint
 from utils.utils import compute_official_ndcg, ranking_scores
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+from subtrack_2b.models.recurrent_depth import repeat_decoder_layer, resolve_recurrent_layer
+
 
 TRACK2_DOMAINS = [
     "biology", "drones", "earth_science", "economics", "hardware", "law",
@@ -264,9 +272,13 @@ def macro_average(per_domain: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
 def resolve_device(requested: str) -> torch.device:
     requested = requested.lower().strip()
     if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("È stato richiesto CUDA ma torch.cuda.is_available() è False.")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS non disponibile.")
     return torch.device(requested)
 
 
@@ -324,6 +336,8 @@ class QwenReranker:
         document_tokens: int = 400,
         batch_size: int = 8,
         query_mode: str = "contextual",
+        recurrent_passes: int = 1,
+        recurrent_layer: int | None = None,
     ) -> None:
         if max_length < 128:
             raise ValueError("--max-length deve essere almeno 128.")
@@ -360,6 +374,13 @@ class QwenReranker:
             low_cpu_mem_usage=True,
         ).to(device).eval()
         self.model.config.use_cache = False
+        if recurrent_passes < 1:
+            raise ValueError("I passaggi ricorrenti devono essere positivi.")
+        self.recurrent_passes = recurrent_passes
+        self.recurrent_index = None
+        self.recurrent_layer = None
+        if recurrent_passes > 1 or recurrent_layer is not None:
+            self.recurrent_index, self.recurrent_layer = resolve_recurrent_layer(self.model, recurrent_layer)
 
         yes_ids = self.tokenizer.encode("yes", add_special_tokens=False)
         no_ids = self.tokenizer.encode("no", add_special_tokens=False)
@@ -507,7 +528,11 @@ class QwenReranker:
         )
         features = {key: value.to(self.device) for key, value in features.items()}
         try:
-            logits = self.model(**features, use_cache=False).logits[:, -1, :]
+            recurrence = nullcontext()
+            if self.recurrent_layer is not None:
+                recurrence = repeat_decoder_layer(self.recurrent_layer, self.recurrent_passes)
+            with recurrence:
+                logits = self.model(**features, use_cache=False).logits[:, -1, :]
         except torch.cuda.OutOfMemoryError:
             if self.device.type != "cuda" or len(encoded) <= 1:
                 raise
@@ -522,8 +547,23 @@ class QwenReranker:
         return self._score_encoded_chunk(encoded[:midpoint]) + self._score_encoded_chunk(encoded[midpoint:])
 
 
+def load_candidate_run(path: Path) -> dict[str, list[tuple[str, float]]]:
+    """Read fixed candidate pools in TREC rank order."""
+    from utils.utils import validate_trec_file
+
+    valid, errors = validate_trec_file(path, max_rank=2**31 - 1)
+    if not valid:
+        raise ValueError(f"TREC non valido: {errors[:5]}")
+    pools = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            topic, _, doc, _, score, _ = line.split()
+            pools.setdefault(topic, []).append((doc, float(score)))
+    return pools
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Valuta reranking Qwen3 sui candidati BM25, senza embedding full-corpus.")
+    parser = argparse.ArgumentParser(description="Valuta il reranking Qwen sui candidati BM25 o su un ranking TREC fisso.")
     parser.add_argument("--config", default="subtrack_2a/config/config.yaml")
     parser.add_argument("--domains", default="biology,medicalsciences", help="Domini separati da virgola; usare 'all' per tutti gli 11.")
     parser.add_argument(
@@ -539,11 +579,21 @@ def main() -> None:
     parser.add_argument("--history-tokens", type=int, default=64)
     parser.add_argument("--document-tokens", type=int, default=400)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--device", default="auto", help="auto | cuda | cpu")
+    parser.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--split", choices=["internal-val", "dev"], default="internal-val")
+    parser.add_argument("--candidate-run", type=Path, help="Ranking TREC fisso da riordinare al posto di BM25.")
+    parser.add_argument("--max-queries-per-domain", type=int)
+    parser.add_argument("--recurrent-passes", type=int, default=1)
+    parser.add_argument("--recurrent-layer", type=int, help="Indice zero-based. Default: layer centrale inferiore.")
+    parser.add_argument("--no-score-cache", action="store_true", help="Rigenera gli score per misurare la latenza.")
+
     args = parser.parse_args()
 
-    if args.top_k < 10 or args.bm25_depth < args.top_k:
+    if args.recurrent_passes < 1 or (args.max_queries_per_domain is not None and args.max_queries_per_domain < 1):
+        parser.error("Passaggi e limite di query devono essere positivi.")
+    fixed_pools = load_candidate_run(args.candidate_run) if args.candidate_run else None
+    if args.top_k < 10 or (fixed_pools is None and args.bm25_depth < args.top_k):
         parser.error("Richiesto --top-k >= 10 e --bm25-depth >= --top-k.")
     if args.batch_size < 1:
         parser.error("--batch-size deve essere >= 1.")
@@ -585,10 +635,10 @@ def main() -> None:
     data_dir = Path(paths[data_key])
     output_dir = Path(paths.get("output_dir", "outputs/subtrack_2a"))
     log_dir = Path(paths.get("log_dir", "outputs/subtrack_2a/logs"))
-    output_path = Path(args.output) if args.output else output_dir / f"reranker_top{args.top_k}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    output_path = Path(args.output) if args.output else output_dir / f"reranker_r{args.recurrent_passes}_top{args.top_k}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
     cache_root = output_dir / "reranker_score_cache" / f"{args.model.replace('/', '_')}_top{args.top_k}_len{args.max_length}_{args.query_mode}"
     logger = setup_logger(log_dir, f"reranker_top{args.top_k}_{general.get('run_tag', 'reteco_2a')}", str(general.get("logging_level", "INFO")))
-    logger.info("BM25 candidate reranking: no full-corpus embeddings; model=%s", args.model)
+    logger.info("Candidate reranking: source=%s model=%s", args.candidate_run or "BM25", args.model)
 
     device = resolve_device(args.device)
     reranker = QwenReranker(
@@ -600,7 +650,14 @@ def main() -> None:
         document_tokens=args.document_tokens,
         batch_size=args.batch_size,
         query_mode=args.query_mode,
+        recurrent_passes=args.recurrent_passes,
+        recurrent_layer=args.recurrent_layer,
     )
+
+    recurrence_meta = {"passes": reranker.recurrent_passes, "layer": reranker.recurrent_index, "use_cache": False}
+    if args.recurrent_passes != 1 or args.recurrent_layer is not None:
+        cache_root = cache_root / f"r{args.recurrent_passes}_layer{reranker.recurrent_index}"
+    reference_label = "bm25" if fixed_pools is None else "candidate_run"
 
     val_ratio = float(data_cfg.get("val_ratio", 0.15))
     max_query_length = int(data_cfg.get("max_query_length", 512))
@@ -610,7 +667,11 @@ def main() -> None:
     index_root = Path(paths.get("hard_negatives_cache_dir", "data/cache/hard_negatives")) / "lucene_indexes"
 
     report: Dict[str, Any] = {
-        "method": "Qwen3-Reranker-0.6B reranking the top BM25 candidates; untouched BM25 tail appended",
+        "method": "Rerank the supplied candidate prefix and append the original tail",
+        "split": args.split,
+        "candidate_source": str(args.candidate_run) if fixed_pools is not None else "bm25",
+        "recurrent_depth": recurrence_meta,
+        "device": str(device),
         "query_mode": args.query_mode,
         "model": args.model,
         "instruction": reranker.instruction,
@@ -618,7 +679,7 @@ def main() -> None:
         "data_dir": str(data_dir),
         "domains_requested": domains,
         "validation_split": {"unit": "conversation", "seed": seed, "val_ratio": val_ratio},
-        "bm25": {"k1": k1, "b": b, "depth": args.bm25_depth},
+        "bm25": {"k1": k1, "b": b, "depth": args.bm25_depth} if fixed_pools is None else None,
         "reranker": {
             "top_k": args.top_k,
             "batch_size": args.batch_size,
@@ -640,14 +701,17 @@ def main() -> None:
     for domain in domains:
         domain_started = time.monotonic()
         domain_dir = data_dir / domain
-        logger.info("[%s] Loading corpus, benchmark_train and qrels_train...", domain)
+        data_split = "dev" if args.split == "dev" else "train"
         corpus = load_corpus(domain_dir / "documents.jsonl")
-        benchmark_path = domain_dir / "benchmark_train.json"
+        benchmark_path = domain_dir / f"benchmark_{data_split}.json"
         if not benchmark_path.is_file():
-            benchmark_path = domain_dir / "benchmark_train.jsonl"
+            benchmark_path = domain_dir / f"benchmark_{data_split}.jsonl"
         samples = load_domain_samples(benchmark_path, domain, max_query_length, query_strategy)
-        qrels = load_qrels(domain_dir / "qrels_train.txt")
-        _, val_samples = split_conversations_train_val(samples, val_ratio, seed)
+        qrels = load_qrels(domain_dir / f"qrels_{data_split}.txt")
+        val_samples = samples
+        if args.split == "internal-val":
+            _, val_samples = split_conversations_train_val(samples, val_ratio, seed)
+        val_samples = val_samples[:args.max_queries_per_domain]
         valid_qrels, fallback_count = prepare_valid_qrels(val_samples, qrels, set(corpus))
         if not valid_qrels:
             raise RuntimeError(f"[{domain}] Nessun giudizio positivo valido nel validation split.")
@@ -658,10 +722,18 @@ def main() -> None:
                     domain, len(corpus), len(val_samples), len(valid_qrels), args.top_k, depth)
 
         bm25_run: Dict[str, List[Tuple[str, float]]] = {}
-        with OfficialBM25(corpus=corpus, k1=k1, b=b, index_dir=index_dir) as bm25:
-            for sample in tqdm(val_samples, desc=f"BM25 [{domain}]", unit="query", leave=False):
+        if fixed_pools is None:
+            with OfficialBM25(corpus=corpus, k1=k1, b=b, index_dir=index_dir) as bm25:
+                for sample in tqdm(val_samples, desc=f"BM25 [{domain}]", unit="query", leave=False):
+                    topic_id = str(sample["topic_id"])
+                    bm25_run[topic_id] = bm25.search_one(sample["contextual_query"], top_k=depth)
+        else:
+            for sample in val_samples:
                 topic_id = str(sample["topic_id"])
-                bm25_run[topic_id] = bm25.search_one(sample["contextual_query"], top_k=depth)
+                ranking = fixed_pools.get(topic_id)
+                if not ranking or any(doc not in corpus for doc, _ in ranking):
+                    raise ValueError(f"Pool TREC mancante o con documenti estranei: {topic_id}")
+                bm25_run[topic_id] = ranking
 
         bm25_metrics = score_run(valid_qrels, bm25_run, len(corpus), fallback_count)
         cache_meta = {
@@ -676,11 +748,14 @@ def main() -> None:
             "instruction": reranker.instruction,
             "query_mode": args.query_mode,
         }
+        if args.recurrent_passes != 1 or args.recurrent_layer is not None:
+            cache_meta["recurrent_depth"] = recurrence_meta
         cache_path = cache_root / f"{domain}.json"
-        cache = load_cache(cache_path, cache_meta)
+        cache = {"meta": cache_meta, "topics": {}} if args.no_score_cache else load_cache(cache_path, cache_meta)
         topic_cache: Dict[str, Any] = cache["topics"]
         reranked_run: Dict[str, List[Tuple[str, float]]] = {}
         cache_hits = 0
+        score_times = []
 
         for q_idx, sample in enumerate(tqdm(val_samples, desc=f"Rerank [{domain}]", unit="query", leave=False), start=1):
             topic_id = str(sample["topic_id"])
@@ -716,14 +791,17 @@ def main() -> None:
                         (str(sample["query"]), str(sample["history"]), corpus[doc_id])
                         for doc_id in candidate_ids
                     ]
+                started = time.perf_counter()
                 candidate_scores = reranker.score_pairs(pair_inputs)
+                score_times.append(time.perf_counter() - started)
                 topic_cache[topic_id] = {
                     "signature": signature,
                     "candidate_ids": candidate_ids,
                     "scores": candidate_scores,
                 }
                 cache["topics"] = topic_cache
-                save_json(cache, cache_path)
+                if not args.no_score_cache:
+                    save_json(cache, cache_path)
 
             candidate_with_scores = list(zip(candidate_ids, candidate_scores))
             order = sorted(range(len(candidate_with_scores)), key=lambda idx: (-candidate_with_scores[idx][1], idx))
@@ -741,22 +819,32 @@ def main() -> None:
             for metric in ("nDCG@10", "MRR", "Recall@10", "Recall@50", "Recall@100", "Recall@1000")
         }
         result = {
-            "bm25": bm25_metrics,
+            reference_label: bm25_metrics,
             "reranked": reranked_metrics,
-            "delta_reranked_minus_bm25": delta,
-            "candidate_pool_recall_at_100": bm25_metrics.get("Recall@100"),
+            f"delta_reranked_minus_{reference_label}": delta,
+            "candidate_pool_recall": sum(
+                len({doc for doc, _ in bm25_run[topic][:args.top_k]} & set(judged)) / len(judged)
+                for topic, judged in valid_qrels.items()
+            ) / len(valid_qrels),
+            "candidate_pool_sha256": sha256_json({
+                topic: [doc for doc, _ in ranking[:args.top_k]] for topic, ranking in bm25_run.items()
+            }),
+            "mean_uncached_query_seconds": sum(score_times) / len(score_times) if score_times else None,
+            "num_timed_queries": len(score_times),
             "num_queries": len(valid_qrels),
             "cache_hits": cache_hits,
             "elapsed_seconds": round(time.monotonic() - domain_started, 2),
         }
+        if fixed_pools is None and args.top_k == 100:
+            result["candidate_pool_recall_at_100"] = result["candidate_pool_recall"]
         report["domains"][domain] = result
         completed_bm25[domain] = bm25_metrics
         completed_reranked[domain] = reranked_metrics
         report["completed_domains"] = list(completed_bm25.keys())
         report["macro_average_completed_domains"] = {
-            "bm25": macro_average(completed_bm25),
+            reference_label: macro_average(completed_bm25),
             "reranked": macro_average(completed_reranked),
-            "delta_reranked_minus_bm25": {
+            f"delta_reranked_minus_{reference_label}": {
                 metric: macro_average(completed_reranked)[metric] - macro_average(completed_bm25)[metric]
                 for metric in ("nDCG@10", "MRR", "Recall@10", "Recall@50", "Recall@100", "Recall@1000")
             },
@@ -764,9 +852,9 @@ def main() -> None:
         report["last_updated"] = datetime.now().isoformat(timespec="seconds")
         save_json(report, output_path)
         logger.info(
-            "[RERANK/%s] BM25 nDCG@10=%.5f | reranked=%.5f | delta=%+.5f | BM25 R@100=%.4f | elapsed=%.1fs | cache_hits=%d/%d",
-            domain, bm25_metrics["nDCG@10"], reranked_metrics["nDCG@10"], delta["nDCG@10"],
-            bm25_metrics["Recall@100"], result["elapsed_seconds"], cache_hits, len(val_samples),
+            "[RERANK/%s] %s nDCG@10=%.5f | reranked=%.5f | delta=%+.5f | pool recall=%.4f | elapsed=%.1fs | cache_hits=%d/%d",
+            domain, reference_label, bm25_metrics["nDCG@10"], reranked_metrics["nDCG@10"], delta["nDCG@10"],
+            result["candidate_pool_recall"], result["elapsed_seconds"], cache_hits, len(val_samples),
         )
         logger.info("[RERANK/MACRO-COMPLETED] %s", report["macro_average_completed_domains"])
         logger.info("[RERANK] Partial report saved: %s", output_path)

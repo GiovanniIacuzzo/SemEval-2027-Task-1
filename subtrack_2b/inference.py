@@ -21,6 +21,8 @@ Caratteristiche:
 """
 
 import argparse
+import hashlib
+import json
 import sys
 import time
 from collections import defaultdict
@@ -136,7 +138,17 @@ def main() -> None:
     parser.add_argument("--topic-ids", type=Path, help="Lista di ID, uno per riga, per confronti appaiati.")
     parser.add_argument("--evidence-strategy", choices=["prefix", "adaptive", "sentences"])
     parser.add_argument("--skip-text-metrics", action="store_true")
+    parser.add_argument("--max-input-tokens", type=int, help="Limite del prompt per il pilot.")
+    parser.add_argument("--max-new-tokens", type=int, help="Limite del decoding per il pilot.")
+    parser.add_argument("--recurrent-passes", type=int, help="Passaggi totali nel layer condiviso. 1 è il controllo senza cache.")
+    parser.add_argument("--recurrent-layer", type=int, help="Indice zero-based. Default: layer centrale inferiore.")
     args = parser.parse_args()
+    if any(limit is not None and limit < 1 for limit in (args.max_input_tokens, args.max_new_tokens)):
+        parser.error("I limiti dei token devono essere positivi.")
+    if args.recurrent_passes is not None and args.recurrent_passes < 1:
+        parser.error("--recurrent-passes deve essere >= 1.")
+    if args.recurrent_layer is not None and args.recurrent_passes is None:
+        parser.error("--recurrent-layer richiede --recurrent-passes.")
 
     if args.zero_shot and args.checkpoint:
         parser.error("--zero-shot e --checkpoint sono incompatibili.")
@@ -422,6 +434,10 @@ def main() -> None:
     generator = ConversationalGenerator.from_pretrained(config, device=device, is_training=False)
     if checkpoint_dir is not None:
         generator.load_checkpoint(checkpoint_dir)
+    if args.recurrent_passes is not None:
+        generator.configure_recurrent_depth(args.recurrent_passes, args.recurrent_layer)
+        logger.info("Ricorrenza: layer=%d passaggi=%d KV cache=off",
+                    generator.recurrent_layer_index, generator.recurrent_passes)
 
     # ==========================================================================
     # 10. GENERATION CONFIG
@@ -435,7 +451,7 @@ def main() -> None:
         )
     )
 
-    max_new_tokens = int(
+    max_new_tokens = args.max_new_tokens or int(
         generation_cfg.get(
             "max_new_tokens",
             512,
@@ -529,7 +545,7 @@ def main() -> None:
     # 11. BUILD INFERENCE DATASET
     # ==========================================================================
 
-    max_input_tokens = int(
+    max_input_tokens = args.max_input_tokens or int(
         data_cfg.get(
             "max_input_tokens",
             3584,
@@ -618,6 +634,8 @@ def main() -> None:
         sample = item["sample"]
         prompt_ids = item["prompt_ids"]
         refine_diagnostics = None
+        generation_start = time.perf_counter()
+        total_output_tokens = 0
 
         # ------------------------------------------------------------------
         # Candidate generation
@@ -640,6 +658,7 @@ def main() -> None:
                     )
                 )
 
+                total_output_tokens += generator.last_output_token_count
                 candidates.append(
                     generated
                 )
@@ -667,6 +686,8 @@ def main() -> None:
                 )
             )
 
+            total_output_tokens += generator.last_output_token_count
+
         # ------------------------------------------------------------------
         # Optional refinement
         # ------------------------------------------------------------------
@@ -687,6 +708,9 @@ def main() -> None:
                 )
             )
 
+            total_output_tokens += generator.last_output_token_count
+
+        generation_seconds = time.perf_counter() - generation_start
         generated_answer = (
             generated_answer.strip()
         )
@@ -718,6 +742,9 @@ def main() -> None:
             "prediction": generated_answer,
             "reference": sample.answer if args.split != "test" else None,
             "prompt": item["prompt_diagnostics"],
+            "prompt_ids_sha256": hashlib.sha256(json.dumps(prompt_ids).encode()).hexdigest(),
+            "generation_seconds": generation_seconds,
+            "generated_tokens_total": total_output_tokens,
             "refine_prompt": refine_diagnostics,
             "gold_passages": sample.gold_passages if args.split != "test" else None,
             "gold_doc_ids": sample.gold_doc_ids,
@@ -816,6 +843,14 @@ def main() -> None:
         },
         "evidence_strategy": evidence_strategy,
         "resolved_strategy": strategy,
+        "max_input_tokens": max_input_tokens,
+        "max_new_tokens": max_new_tokens,
+        "elapsed_seconds": elapsed_time,
+        "recurrent_depth": {
+            "passes": generator.recurrent_passes,
+            "layer": generator.recurrent_layer_index,
+            "use_cache": generator.recurrent_passes is None,
+        },
         "documented_missing_gold_ids": diagnostics.get("documented_missing_gold_ids_count", 0),
         "topic_ids": [sample.topic_id for sample in samples],
     }
