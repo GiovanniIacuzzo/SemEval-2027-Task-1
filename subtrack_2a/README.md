@@ -251,3 +251,34 @@ Do not launch a costly full training run until the data path, active domains, va
 - Ali et al. (2026), [*RECOR: Reasoning-focused Multi-turn Conversational Retrieval Benchmark*](https://aclanthology.org/2026.findings-acl.129/), Findings of ACL 2026.
 
 [← Back to project overview](../README.md) · [Go to Sub-track 2b →](../subtrack_2b/README.md)
+
+## Run confrontabili e submission
+
+Il backend BM25 usa Pyserini 1.3.0 e Java 21. Da radice del repository, questa sequenza usa il medesimo split e i domini
+del YAML. Per la selezione delle impostazioni, usa lo split interno di train
+scritto dal training o dagli script di reranking. Usa `dev` per misurare
+una configurazione già scelta.
+
+```bash
+python subtrack_2a/inference.py --split dev --ablation B
+python subtrack_2a/inference.py --split dev --ablation C
+python subtrack_2a/inference.py --split dev --ablation D --query-mode reasoned
+python subtrack_2a/inference.py --split dev --ablation E --query-mode reasoned
+python subtrack_2a/inference.py --split dev --ablation F --query-mode reasoned
+```
+
+A/B usano solo BM25, C usa il dense pretrained, D–G richiedono il checkpoint
+dense. F usa il cross-encoder pretrained, G richiede il suo checkpoint.
+`--query-mode reasoned` genera le riscritture da domanda e cronologia e le
+riusa solo per i medesimi input e impostazioni. I report usano nDCG con
+`pytrec_eval`. I nomi dei run distinguono split, ablation e modalità di query.
+
+L'inferenza accetta `--split test --data-dir DIR --output-dir OUT`.
+Il layout atteso è `DIR/<domain>/benchmark_test.json` (o JSONL), con il
+relativo `documents.jsonl`. Verifica l'export con la lista completa degli ID
+attesi per la release:
+
+```bash
+python subtrack_2a/generate_submission.py --run test_run_E_reasoned.trec \
+  --expected-ids official_topic_ids.txt --output submission_2a.trec
+```

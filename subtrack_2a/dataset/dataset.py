@@ -30,7 +30,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-import torch
 from torch.utils.data import Dataset, Sampler
 from transformers import PreTrainedTokenizerBase
 
@@ -554,7 +553,7 @@ def load_track2_domain_data(
         raise FileNotFoundError(
             f"Benchmark {split} non trovato per il dominio {domain}: {benchmark_path}"
         )
-    if not qrels_path.exists():
+    if split != "test" and not qrels_path.exists():
         raise FileNotFoundError(
             f"Qrels {split} non trovati per il dominio {domain}: {qrels_path}"
         )
@@ -572,7 +571,7 @@ def load_track2_domain_data(
         formatter=formatter,
         query_rewrites=query_rewrites,
     )
-    qrels = load_qrels(qrels_path)
+    qrels = {} if split == "test" else load_qrels(qrels_path)
     return corpus, samples, qrels
 
 

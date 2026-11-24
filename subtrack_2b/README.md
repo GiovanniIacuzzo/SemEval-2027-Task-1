@@ -281,3 +281,62 @@ Check the current script's `--help` output if CLI flags have changed since this 
 - [Hugging Face bitsandbytes quantization documentation](https://huggingface.co/docs/transformers/en/quantization/bitsandbytes)
 
 [← Back to project overview](../README.md) · [← Sub-track 2a](../subtrack_2a/README.md)
+
+## Run comparabili e profilo T4
+
+`config/t4_qwen3_4b.yaml` usa Qwen3-4B-Instruct-2507, NF4 su CUDA, 2.048
+token per il prompt, 256 per la risposta e LoRA su Q/V. Per misurare l'effetto
+del budget con lo stesso backbone e la stessa validation interna, esegui dalla
+radice della repo:
+
+```bash
+python subtrack_2b/inference.py --config subtrack_2b/config/t4_qwen3_4b.yaml \
+  --split internal-val --zero-shot --evidence-strategy prefix \
+  --skip-text-metrics --output-dir outputs/2b_prefix
+
+python subtrack_2b/inference.py --config subtrack_2b/config/t4_qwen3_4b.yaml \
+  --split internal-val --zero-shot --evidence-strategy adaptive \
+  --topic-ids outputs/2b_prefix/topic_ids.txt \
+  --skip-text-metrics --output-dir outputs/2b_adaptive
+```
+
+`prefix` è il controllo con metà budget destinata ai passaggi. `adaptive`
+usa lo spazio disponibile dopo template, domanda e cronologia. `sentences`
+prova a conservare frasi pertinenti quando l'evidenza supera il budget,
+mantenendone l'ordine. Il JSONL diagnostico indica quanta evidenza ha visto il
+modello, anche durante `--strategy refine`. Per la release pubblica, conserva
+`split_manifest.json` accanto a `track2_recor/`: gli ID gold dichiarati assenti
+dagli organizzatori vengono registrati separatamente dagli errori di lookup.
+
+Per la valutazione locale in cieco, genera una scheda e tieni separata la chiave.
+Compila un intero da 1 a 5 per dimensione e per caso. Lo script riporta i
+punteggi normalizzati a [0, 1], le differenze appaiate per dominio e profondità
+e la media tra domini.
+
+```bash
+python subtrack_2b/evaluate_generation.py prepare \
+  --baseline outputs/2b_prefix/internal-val_predictions.jsonl \
+  --candidate outputs/2b_adaptive/internal-val_predictions.jsonl \
+  --review outputs/2b_review.json --key outputs/2b_review_key.json
+python subtrack_2b/evaluate_generation.py score \
+  --review outputs/2b_review.json --key outputs/2b_review_key.json \
+  --output outputs/2b_review_scores.json
+```
+
+Il training salva checkpoint in `paths.checkpoint_dir/general.run_tag` e usa
+il suffisso `_smoke_test` per gli smoke test. Usa un tag nuovo per ogni
+esperimento e lo stesso YAML per riprendere con `--resume`. A fine epoca,
+`save_strategy: epoch` mantiene i candidati per la valutazione generativa.
+`best_model` indica la minima loss interna. Per i checkpoint precedenti alla
+nuova struttura, passa il loro percorso con `--checkpoint`.
+
+Per il test, passa `--split test --data-dir DIR --benchmark-file NOME.json`.
+La directory contiene una sottocartella per ogni dominio configurato. I
+passaggi possono essere inline oppure risolti per ID tramite
+`documents.jsonl`. Il comando esporta solo turni validati. Per una verifica
+indipendente della copertura con il formato pubblicato:
+
+```bash
+python subtrack_2b/generate_submission.py --predictions generation_test.jsonl \
+  --expected-ids official_topic_ids.txt --output submission_2b.jsonl
+```

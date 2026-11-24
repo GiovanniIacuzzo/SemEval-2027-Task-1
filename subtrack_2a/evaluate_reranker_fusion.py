@@ -6,10 +6,12 @@ BM25 run, reads per-query cached reranker scores, and compares BM25, pure
 reranking, and Reciprocal Rank Fusion (RRF) variants on the same internal split.
 """
 from __future__ import annotations
-import argparse, json, math, random
+import argparse
+import json
+import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List
 import yaml
 
 # Running this script from the repository root or from its own path is supported.
@@ -18,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from retrieval.retrieval import OfficialBM25, _corpus_fingerprint
+from evaluate_retrieval import prepare_valid_qrels, score_run
 
 DOMAINS = ["biology", "drones", "earth_science", "economics", "hardware", "law",
            "medicalsciences", "politics", "psychology", "robotics", "sustainable_living"]
@@ -115,48 +118,6 @@ def split_samples(samples: List[Dict[str, Any]], ratio: float, seed: int):
     return [s for s in samples if str(s["conversation_id"]) not in val_ids], [s for s in samples if str(s["conversation_id"]) in val_ids]
 
 
-def valid_qrels_for(samples, qrels, corpus_ids):
-    valid: Dict[str, Dict[str, int]] = {}
-    fallback = 0
-    for s in samples:
-        topic = str(s["topic_id"])
-        judged = {str(d): int(r) for d, r in qrels.get(topic, {}).items() if str(d) in corpus_ids and int(r) > 0}
-        if not judged:
-            judged = {str(d): 1 for d in s["gold_doc_ids"] if str(d) in corpus_ids}
-            if judged:
-                fallback += 1
-        if judged:
-            valid[topic] = judged
-    return valid, fallback
-
-
-def metrics(qrels: Dict[str, Dict[str, int]], run: Dict[str, List[Tuple[str, float]]], corpus_size: int, fallback: int):
-    ndcgs, mrrs = [], []
-    recalls: Dict[int, List[float]] = {10: [], 50: [], 100: [], 1000: []}
-    for topic, judged in qrels.items():
-        ranked = run.get(topic, [])
-        ids = [str(d) for d, _ in ranked]
-        rels = {str(d): int(r) for d, r in judged.items()}
-        dcg = sum((2 ** rels.get(str(d), 0) - 1) / math.log2(i + 2)
-                  for i, (d, _) in enumerate(ranked[:10]))
-        ideal = sorted(rels.values(), reverse=True)[:10]
-        idcg = sum((2 ** rel - 1) / math.log2(i + 2) for i, rel in enumerate(ideal))
-        ndcgs.append(dcg / idcg if idcg else 0.0)
-        gold = set(rels)
-        for k in recalls:
-            recalls[k].append(len(set(ids[:k]) & gold) / max(1, len(gold)))
-        mrrs.append(next((1.0 / (i + 1) for i, d in enumerate(ids) if d in gold), 0.0))
-    out = {
-        "nDCG@10": sum(ndcgs) / len(ndcgs) if ndcgs else 0.0,
-        "MRR": sum(mrrs) / len(mrrs) if mrrs else 0.0,
-        "num_topics": len(qrels), "num_documents": corpus_size,
-        "qrels_fallback_topics": fallback,
-    }
-    for k, vals in recalls.items():
-        out[f"Recall@{k}"] = sum(vals) / len(vals) if vals else 0.0
-    return out
-
-
 def mean_metrics(per_domain: Dict[str, Dict[str, float]]):
     names = ["nDCG@10", "MRR", "Recall@10", "Recall@50", "Recall@100", "Recall@1000"]
     return {key: sum(float(v[key]) for v in per_domain.values()) / len(per_domain)
@@ -183,7 +144,7 @@ def main():
     if not config_path.is_file(): p.error(f"Config not found: {args.config}")
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     gen, paths = cfg.get("general", {}), cfg.get("paths", {})
-    data_cfg, domains_cfg, sparse_cfg = cfg.get("data", {}), cfg.get("domains", {}), cfg.get("sparse", {})
+    data_cfg, sparse_cfg = cfg.get("data", {}), cfg.get("sparse", {})
     if args.domains.strip().lower() == "all": domains = DOMAINS[:]
     else: domains = [x.strip() for x in args.domains.split(",") if x.strip()]
     bad = [d for d in domains if d not in DOMAINS]
@@ -212,7 +173,7 @@ def main():
         samples = load_samples(bench, domain, max_query_len, strategy)
         qrels_all = load_qrels(ddir / "qrels_train.txt")
         _, val_samples = split_samples(samples, ratio, seed)
-        qrels, fallback = valid_qrels_for(val_samples, qrels_all, set(corpus))
+        qrels, fallback = prepare_valid_qrels(val_samples, qrels_all, set(corpus))
         fingerprint = _corpus_fingerprint(corpus)
         bm25_cache_dir = index_root / fingerprint
         bm25_run = {}
@@ -266,7 +227,7 @@ def main():
 
         per_domain_details[domain] = {"num_queries": len(qrels), "qrels_fallback_topics": fallback}
         for system, run in sys_runs.items():
-            per_sys_domain.setdefault(system, {})[domain] = metrics(qrels, run, len(corpus), fallback)
+            per_sys_domain.setdefault(system, {})[domain] = score_run(qrels, run, len(corpus), fallback)
         print(f"\n[{domain}] nDCG@10", end="")
         for system in systems:
             m = per_sys_domain[system][domain]

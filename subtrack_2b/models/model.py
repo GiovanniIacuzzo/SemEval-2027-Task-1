@@ -17,7 +17,8 @@ Supporto a:
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from importlib.metadata import PackageNotFoundError
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -246,8 +247,10 @@ class ConversationalGenerator(nn.Module):
             model_name,
         )
 
+        revision = model_cfg.get("revision")
         instance.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
+            revision=revision,
             trust_remote_code=trust_remote,
             padding_side=(
                 "right"
@@ -305,8 +308,6 @@ class ConversationalGenerator(nn.Module):
 
             else:
                 try:
-                    import bitsandbytes  # noqa: F401
-
                     from transformers import BitsAndBytesConfig
 
                     compute_dtype = (
@@ -332,19 +333,16 @@ class ConversationalGenerator(nn.Module):
                         "(bitsandbytes/NF4) abilitata."
                     )
 
-                except ImportError:
-                    logger.warning(
-                        "bitsandbytes non disponibile: "
-                        "disabilito load_in_4bit."
-                    )
-                    load_4bit = False
+                except (ImportError, PackageNotFoundError) as exc:
+                    raise RuntimeError("La quantizzazione NF4 su CUDA richiede bitsandbytes.") from exc
 
         # ----------------------------------------------------------------------
         # Model kwargs
         # ----------------------------------------------------------------------
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": trust_remote,
-            "dtype": torch_dtype,
+            "torch_dtype": torch_dtype,
+            "revision": revision,
         }
 
         if quantization_config is not None:
@@ -625,7 +623,7 @@ class ConversationalGenerator(nn.Module):
     @torch.inference_mode()
     def generate_single(
         self,
-        prompt: str,
+        prompt: Union[str, List[int]],
         max_new_tokens: int = 512,
         do_sample: bool = False,
         temperature: float = 0.7,
@@ -655,9 +653,10 @@ class ConversationalGenerator(nn.Module):
             self._get_model_input_device()
         )
 
-        encoded = self._encode_prompt(
-            prompt,
-            return_tensors="pt",
+        encoded = (
+            torch.tensor([prompt], dtype=torch.long)
+            if isinstance(prompt, list)
+            else self._encode_prompt(prompt, return_tensors="pt")
         )
 
         if isinstance(encoded, dict):
@@ -862,12 +861,17 @@ class ConversationalGenerator(nn.Module):
 
         if adapter_exists:
             try:
-                from peft import PeftModel
+                from peft import PeftConfig, PeftModel
             except ImportError as exc:
                 raise RuntimeError(
                     "Il checkpoint è un adapter PEFT/LoRA "
                     "ma PEFT non è installato."
                 ) from exc
+
+            adapter_model = PeftConfig.from_pretrained(str(path)).base_model_name_or_path
+            configured_model = self.config.get("model", {}).get("name")
+            if configured_model and adapter_model != configured_model:
+                raise ValueError(f"Backbone dell'adapter: {adapter_model}; configurato: {configured_model}.")
 
             # ------------------------------------------------------------------
             # Caso 1: base model già PeftModel
@@ -944,6 +948,8 @@ class ConversationalGenerator(nn.Module):
         full_model_files = [
             path / "model.safetensors",
             path / "pytorch_model.bin",
+            path / "model.safetensors.index.json",
+            path / "pytorch_model.bin.index.json",
         ]
 
         has_full_hf_checkpoint = (
@@ -973,7 +979,7 @@ class ConversationalGenerator(nn.Module):
                     "trust_remote_code",
                     True,
                 ),
-                "dtype": torch_dtype,
+                "torch_dtype": torch_dtype,
             }
 
             loaded_model = (

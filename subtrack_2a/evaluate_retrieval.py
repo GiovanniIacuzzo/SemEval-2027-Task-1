@@ -32,6 +32,7 @@ import yaml
 from tqdm import tqdm
 
 from retrieval.retrieval import OfficialBM25, _corpus_fingerprint
+from utils.utils import compute_official_ndcg, ranking_scores
 
 TRACK2_DOMAINS = [
     "biology", "drones", "earth_science", "economics", "hardware", "law",
@@ -214,51 +215,31 @@ def split_conversations_train_val(samples: List[Dict[str, Any]], val_ratio: floa
 
 
 def prepare_valid_qrels(samples: Sequence[Dict[str, Any]], qrels: Mapping[str, Mapping[str, int]], corpus_ids: set[str]) -> Tuple[Dict[str, Dict[str, int]], int]:
-    valid: Dict[str, Dict[str, int]] = {}
-    fallback_count = 0
+    valid = {}
     for sample in samples:
-        topic_id = str(sample["topic_id"])
-        judged = {
-            str(doc_id): int(rel)
-            for doc_id, rel in qrels.get(topic_id, {}).items()
-            if str(doc_id) in corpus_ids and int(rel) > 0
-        }
-        if not judged:
-            fallback = {str(doc_id): 1 for doc_id in sample["gold_doc_ids"] if str(doc_id) in corpus_ids}
-            if fallback:
-                judged = fallback
-                fallback_count += 1
-        if judged:
-            valid[topic_id] = judged
-    return valid, fallback_count
+        topic = str(sample["topic_id"])
+        judged = {str(doc_id): int(rel) for doc_id, rel in qrels.get(topic, {}).items() if int(rel) > 0}
+        if not judged or judged.keys() - corpus_ids:
+            raise ValueError(f"Qrels mancanti o incoerenti con il corpus: {topic}")
+        valid[topic] = judged
+    return valid, 0
 
 
 def score_run(valid_qrels: Dict[str, Dict[str, int]], run: Dict[str, List[Tuple[str, float]]], corpus_size: int, fallback_topics: int) -> Dict[str, Any]:
-    topic_ndcgs: List[float] = []
+    encoded_run = {topic: ranking_scores(ranked) for topic, ranked in run.items()}
+    ndcg = compute_official_ndcg(valid_qrels, encoded_run)["ndcg_cut_10"]
     recalls: Dict[int, List[float]] = {10: [], 50: [], 100: [], 1000: []}
     reciprocal_ranks: List[float] = []
 
     for topic_id, judged in valid_qrels.items():
-        ranked = run.get(topic_id, [])
-        ranked_ids = [str(doc_id) for doc_id, _ in ranked]
-        rel_by_doc = {str(doc_id): int(rel) for doc_id, rel in judged.items()}
-
-        dcg = 0.0
-        for rank, (doc_id, _) in enumerate(ranked[:10], start=1):
-            rel = rel_by_doc.get(str(doc_id), 0)
-            if rel > 0:
-                dcg += (2.0 ** rel - 1.0) / math.log2(rank + 1)
-        ideal_rels = sorted((int(rel) for rel in judged.values()), reverse=True)[:10]
-        idcg = sum((2.0 ** rel - 1.0) / math.log2(rank + 1) for rank, rel in enumerate(ideal_rels, start=1))
-        topic_ndcgs.append(dcg / idcg if idcg > 0 else 0.0)
-
+        ranked_ids = list(encoded_run.get(topic_id, {}))
         gold_ids = set(judged)
         for cutoff in recalls:
             recalls[cutoff].append(len(set(ranked_ids[:cutoff]) & gold_ids) / max(1, len(gold_ids)))
         reciprocal_ranks.append(next((1.0 / rank for rank, doc_id in enumerate(ranked_ids, start=1) if doc_id in gold_ids), 0.0))
 
     result: Dict[str, Any] = {
-        "nDCG@10": sum(topic_ndcgs) / len(topic_ndcgs) if topic_ndcgs else 0.0,
+        "nDCG@10": ndcg,
         "MRR": sum(reciprocal_ranks) / len(reciprocal_ranks) if reciprocal_ranks else 0.0,
         "num_topics": len(valid_qrels),
         "num_documents": corpus_size,
@@ -514,40 +495,13 @@ class QwenReranker:
                 tokens = self._query_tokens(query, history)
                 query_token_cache[cache_key] = tokens
             encoded.append(self._format_ids_from_tokens(tokens[0], tokens[1], document))
-        all_scores: List[float] = []
+        all_scores = []
         for start in range(0, len(encoded), self.batch_size):
-            chunk = encoded[start : start + self.batch_size]
-            features = self.tokenizer.pad(
-                [{"input_ids": ids} for ids in chunk],
-                padding=True,
-                return_tensors="pt",
-            )
-            features = {key: value.to(self.device) for key, value in features.items()}
-            try:
-                logits = self.model(**features, use_cache=False).logits[:, -1, :]
-            except torch.cuda.OutOfMemoryError:
-                if self.device.type != "cuda" or len(chunk) <= 1:
-                    raise
-                torch.cuda.empty_cache()
-                # Retry this chunk recursively with half batches to recover safely.
-                midpoint = len(chunk) // 2
-                first = self._score_encoded_chunk(chunk[:midpoint])
-                second = self._score_encoded_chunk(chunk[midpoint:])
-                all_scores.extend(first)
-                all_scores.extend(second)
-                continue
-            scores = logits[:, self.yes_token_id] - logits[:, self.no_token_id]
-            all_scores.extend(float(value) for value in scores.float().cpu().tolist())
-            del logits, features
+            all_scores.extend(self._score_encoded_chunk(encoded[start : start + self.batch_size]))
         return all_scores
 
     @torch.inference_mode()
     def _score_encoded_chunk(self, encoded: Sequence[List[int]]) -> List[float]:
-        if not encoded:
-            return []
-        if self.device.type == "cuda" and len(encoded) > 1:
-            # Keep OOM recovery bounded and deterministic.
-            pass
         features = self.tokenizer.pad(
             [{"input_ids": ids} for ids in encoded], padding=True, return_tensors="pt"
         )
@@ -557,14 +511,15 @@ class QwenReranker:
         except torch.cuda.OutOfMemoryError:
             if self.device.type != "cuda" or len(encoded) <= 1:
                 raise
-            del features
-            torch.cuda.empty_cache()
-            midpoint = len(encoded) // 2
-            return self._score_encoded_chunk(encoded[:midpoint]) + self._score_encoded_chunk(encoded[midpoint:])
-        scores = logits[:, self.yes_token_id] - logits[:, self.no_token_id]
-        result = [float(value) for value in scores.float().cpu().tolist()]
-        del logits, features
-        return result
+        else:
+            scores = logits[:, self.yes_token_id] - logits[:, self.no_token_id]
+            return [float(value) for value in scores.float().cpu().tolist()]
+
+        # Leave the exception handler before retrying so its traceback releases GPU tensors.
+        del features
+        torch.cuda.empty_cache()
+        midpoint = len(encoded) // 2
+        return self._score_encoded_chunk(encoded[:midpoint]) + self._score_encoded_chunk(encoded[midpoint:])
 
 
 def main() -> None:

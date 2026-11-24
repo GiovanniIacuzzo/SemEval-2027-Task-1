@@ -260,6 +260,15 @@ def reciprocal_rank_fusion(
 # TREC run output and validation
 # =============================================================================
 
+def ranking_scores(ranking: Sequence[Tuple[str, float]]) -> Dict[str, float]:
+    """Encode rank as a score for TREC and pytrec_eval, preserving tie order."""
+    documents = {}
+    for doc_id, score in ranking:
+        if math.isfinite(float(score)) and str(doc_id) not in documents:
+            documents[str(doc_id)] = -float(len(documents))
+    return documents
+
+
 def write_trec_run(
     run_dict: Mapping[str, Sequence[Tuple[str, float]]],
     output_path: Union[str, Path],
@@ -280,24 +289,13 @@ def write_trec_run(
         ordered_topics = sorted(run_dict.items(), key=lambda pair: str(pair[0]))
         for raw_topic_id, ranking in ordered_topics:
             topic_id = str(raw_topic_id)
-            seen: set[str] = set()
-            rank = 0
-            for item in list(ranking or [])[:max_k]:
-                if not isinstance(item, (tuple, list)) or len(item) != 2:
-                    raise ValueError(f"Ranking malformato per topic {topic_id}: {item!r}")
-                doc_id, raw_score = item
-                topic = str(topic_id)
-                doc = str(doc_id)
-                if not topic or not doc or any(ch.isspace() for ch in topic + doc):
+            scores = ranking_scores(ranking)
+            for rank, (doc, score) in enumerate(scores.items(), start=1):
+                if rank > max_k:
+                    break
+                if not topic_id or not doc or any(ch.isspace() for ch in topic_id + doc):
                     raise ValueError("topic_id e doc_id TREC devono essere non vuoti e senza spazi.")
-                if doc in seen:
-                    continue
-                score = float(raw_score)
-                if not math.isfinite(score):
-                    continue
-                seen.add(doc)
-                rank += 1
-                handle.write(f"{topic} Q0 {doc} {rank} {score:.8f} {run_tag}\n")
+                handle.write(f"{topic_id} Q0 {doc} {rank} {score:.8f} {run_tag}\n")
 
 
 def validate_trec_file(
@@ -312,6 +310,7 @@ def validate_trec_file(
     errors: List[str] = []
     ranks_by_topic: Dict[str, List[int]] = {}
     seen_docs: Dict[str, set[str]] = {}
+    previous_scores: Dict[str, float] = {}
 
     try:
         handle = path.open("r", encoding="utf-8")
@@ -350,6 +349,9 @@ def validate_trec_file(
             if rank > int(max_rank):
                 errors.append(f"Riga {line_no}: rango {rank} > max_rank {max_rank}.")
 
+            if score > previous_scores.get(topic_id, math.inf):
+                errors.append(f"Riga {line_no}: score crescente per topic {topic_id}.")
+            previous_scores[topic_id] = score
             ranks_by_topic.setdefault(topic_id, []).append(rank)
             docs = seen_docs.setdefault(topic_id, set())
             if doc_id in docs:
@@ -363,6 +365,8 @@ def validate_trec_file(
                 f"Topic {topic_id}: ranghi non sequenziali nell'ordine del file; "
                 f"atteso {expected}, trovato {ranks}."
             )
+    if not ranks_by_topic:
+        errors.append("File TREC senza risultati.")
     return not errors, errors
 
 

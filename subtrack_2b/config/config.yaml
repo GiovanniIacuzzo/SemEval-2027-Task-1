@@ -82,6 +82,7 @@ training:
   early_stopping_patience: 2
 
 prompt:
+  evidence_strategy: "adaptive"      # prefix | adaptive | sentences
   ablation: "D"                     # A: query_only | B: query+hist | C: query+evid | D: full (hist+evid+query) | E: with_reasoning
   use_subquestion_reasoning: false   # Se true, include il campo ausiliario nel prompt
   include_domain: true

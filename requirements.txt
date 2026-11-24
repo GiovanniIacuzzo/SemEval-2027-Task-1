@@ -1,4 +1,5 @@
-transformers>=4.48,<5
+transformers>=4.51,<5
+Jinja2>=3.1
 peft>=0.20
 accelerate>=1.2
 bitsandbytes>=0.48
@@ -9,5 +10,6 @@ safetensors>=0.4
 rouge-score>=0.1.2
 nltk>=3.9
 bert-score>=0.3.13
-pyserini
+pyserini==1.3.0
+openai==1.109.1
 pytrec_eval

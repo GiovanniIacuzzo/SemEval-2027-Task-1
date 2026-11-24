@@ -24,11 +24,13 @@ Caratteristiche:
 """
 
 import argparse
+import json
+import re
 import math
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -52,7 +54,7 @@ if str(ROOT_DIR) not in sys.path:
 from subtrack_2b.dataset.dataset import (
     GroundedDataCollator,
     GroundedGenerationDataset,
-    GroundedTurnSample,
+    _normalize_active_domains,
     apply_domain_balanced_sampling,
     load_all_domains_data,
     split_conversations_train_val,
@@ -186,9 +188,6 @@ def _load_model_for_resume(
 
     if is_peft:
         try:
-            # Import locale per non rendere PEFT obbligatorio in full FT.
-            from peft import PeftModel  # noqa: F401
-
             adapter_files = [
                 last_dir / "adapter_model.safetensors",
                 last_dir / "adapter_model.bin",
@@ -410,18 +409,8 @@ def main() -> None:
     # ==========================================================================
 
     cfg_path = Path(args.config)
-
-    if not cfg_path.exists():
-        cfg_path = (
-            Path(__file__).resolve().parent
-            / "config"
-            / "config.yaml"
-        )
-
-    if not cfg_path.exists():
-        raise FileNotFoundError(
-            f"Config non trovato: {args.config}"
-        )
+    if not cfg_path.is_file():
+        parser.error(f"Config non trovato: {cfg_path}")
 
     config = load_yaml(cfg_path)
 
@@ -475,8 +464,12 @@ def main() -> None:
         )
     )
 
+    if args.smoke_test and args.resume:
+        parser.error("--smoke-test e --resume sono incompatibili.")
     if args.smoke_test:
         run_tag += "_smoke_test"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_tag):
+        parser.error("general.run_tag deve essere un singolo nome di directory.")
 
     # ==========================================================================
     # 3. DIRECTORIES
@@ -489,19 +482,13 @@ def main() -> None:
         )
     )
 
-    checkpoint_dir = ensure_dir(
-        paths_cfg.get(
-            "checkpoint_dir",
-            "checkpoints/subtrack_2b",
-        )
-    )
-
-    output_dir = ensure_dir(
-        paths_cfg.get(
-            "output_dir",
-            "outputs/subtrack_2b",
-        )
-    )
+    checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2b")) / run_tag
+    output_dir = Path(paths_cfg.get("output_dir", "outputs/subtrack_2b")) / run_tag
+    if not args.resume:
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    elif not _resume_state_path(checkpoint_dir).is_file():
+        raise FileNotFoundError(f"Stato di resume mancante: {checkpoint_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logging(
         log_dir,
@@ -534,11 +521,13 @@ def main() -> None:
         cfg_path,
     )
 
-    # Salva una copia JSON della config effettivamente utilizzata.
-    save_json(
-        config,
-        checkpoint_dir / "training_config.json",
-    )
+    config_snapshot = checkpoint_dir / "training_config.json"
+    if args.resume:
+        saved_config = json.loads(config_snapshot.read_text(encoding="utf-8"))
+        if saved_config != config:
+            raise ValueError("--resume richiede la configurazione salvata con la run.")
+    else:
+        save_json(config, config_snapshot)
 
     # ==========================================================================
     # 4. DEVICE
@@ -697,6 +686,14 @@ def main() -> None:
             "Esempi con answer vuota: %d",
             empty_answers,
         )
+
+    expected_domains = set(_normalize_active_domains(active_domains, all_domains))
+    if expected_domains - set(diagnostics["domains_loaded"]):
+        raise ValueError("Mancano domini richiesti per il training.")
+    if diagnostics.get("documented_missing_gold_ids_count", 0):
+        logger.info("ID assenti già documentati dalla release: %d", diagnostics["documented_missing_gold_ids_count"])
+    if missing_ids_count or examples_without_evidence or diagnostics["empty_query_count"] or empty_answers:
+        raise ValueError("Dati di training incompleti: controlla domanda, target e passaggi gold.")
 
     # ==========================================================================
     # 7. INTERNAL VALIDATION SPLIT
@@ -909,6 +906,7 @@ def main() -> None:
             use_subquestion_reasoning
         ),
         is_training=True,
+        evidence_strategy=prompt_cfg.get("evidence_strategy", "adaptive"),
     )
 
     # ==========================================================================
@@ -935,6 +933,7 @@ def main() -> None:
             use_subquestion_reasoning
         ),
         is_training=True,
+        evidence_strategy=prompt_cfg.get("evidence_strategy", "adaptive"),
     )
 
     # ==========================================================================
@@ -1251,11 +1250,6 @@ def main() -> None:
     epochs_without_improvement = 0
 
     if args.resume:
-        if args.smoke_test:
-            raise ValueError(
-                "--resume e --smoke-test non possono essere usati insieme."
-            )
-
         if not last_dir.exists():
             raise FileNotFoundError(
                 f"Resume richiesto ma last_model non esiste: {last_dir}"
@@ -1644,9 +1638,9 @@ def main() -> None:
         # 25. LAST CHECKPOINT
         # ==========================================================================
 
-        generator.save_checkpoint(
-            last_dir
-        )
+        generator.save_checkpoint(last_dir)
+        if not args.smoke_test and training_cfg.get("save_strategy") == "epoch":
+            generator.save_checkpoint(checkpoint_dir / f"epoch_{epoch:02d}")
 
         # ==========================================================================
         # 26. FULL TRAINING STATE

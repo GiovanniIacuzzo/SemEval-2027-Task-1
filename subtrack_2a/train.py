@@ -17,13 +17,13 @@ viene scaricato dalla GPU prima di caricare il bi-encoder.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import collections
 import gc
 import json
 import logging
 import math
 import os
-import random
 import re
 import sys
 import time
@@ -52,7 +52,7 @@ from dataset.dataset import (
 from models.model import ConversationalBiEncoder, ConversationalQueryRewriter
 from retrieval.retrieval import OfficialBM25, _corpus_fingerprint, mine_bm25_hard_negatives
 from utils.utils import (
-    compute_official_ndcg, load_config, reciprocal_rank_fusion, save_json, setup_logger, set_seed,
+    compute_official_ndcg, ranking_scores, load_config, reciprocal_rank_fusion, save_json, setup_logger, set_seed,
 )
 
 
@@ -140,6 +140,7 @@ def prepare_query_rewrites(
     seed: int,
     val_ratio: float,
     val_samples_by_domain: Optional[Dict[str, List[ConversationalTurnSample]]] = None,
+    source_split: str = "train",
 ) -> Dict[str, Dict[str, str]]:
     """Restituisce una cache per dominio e genera solo le riscritture mancanti.
 
@@ -162,7 +163,14 @@ def prepare_query_rewrites(
         val_samples = (val_samples_by_domain or {}).get(domain, [])
         # Training + validation interna (nessun qrels coinvolto nella riscrittura).
         samples_to_rewrite = list(train_samples) + list(val_samples)
-        cache_path = cache_root / f"{safe_component(domain)}_{seed_tag}_{cache_tag}.json"
+        signature_payload = {
+            "config": {key: value for key, value in rewrite_cfg.items() if key != "overwrite_cache"},
+            "turns": sorted((sample.topic_id, sample.query, sample.history) for sample in samples_to_rewrite),
+            "model": rewrite_model_name,
+            "prompt": ConversationalQueryRewriter.SYSTEM_PROMPT,
+        }
+        signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()[:16]
+        cache_path = cache_root / f"{safe_component(domain)}_{source_split}_{seed_tag}_{cache_tag}_{signature}.json"
 
         if cache_path.exists() and not overwrite:
             existing = load_query_rewrites(cache_path)
@@ -201,7 +209,7 @@ def prepare_query_rewrites(
             metadata = {
                 "purpose": "subtrack_2a_train_and_internal_validation_query_rewrites",
                 "domain": domain,
-                "source_split": "benchmark_train.json",
+                "source_split": source_split,
                 "internal_train_seed": seed,
                 "internal_validation_ratio": val_ratio,
                 "generator_model": rewrite_model_name,
@@ -222,10 +230,11 @@ def prepare_query_rewrites(
             checkpoint_every = int(
                 rewrite_cfg.get("checkpoint_every", 8)
             )
-            updated = rewriter.rewrite_samples(
+            updated = rewriter.rewrite_batch(
                 missing,
                 existing=existing,
                 overwrite=False,
+                batch_size=int(rewrite_cfg.get("batch_size", 4)),
                 progress_desc=f"Rewrite [{domain}]",
                 checkpoint_every=checkpoint_every,
                 checkpoint_callback=persist_rewrite_checkpoint,
@@ -493,7 +502,7 @@ def evaluate_retrieval_comparison_per_domain(
             if compare_query_modes else dense_contextual
         )
 
-        del corpus_embeddings
+        corpus_embeddings = None
         clear_device_cache(device)
 
         # ------------------------------------------------------------------
@@ -564,14 +573,14 @@ def evaluate_retrieval_comparison_per_domain(
         # ------------------------------------------------------------------
         def score_run(run: Dict[str, List[Tuple[str, float]]]) -> Dict[str, float]:
             score_map = {
-                topic_id: {doc_id: float(score) for doc_id, score in ranking}
+                topic_id: ranking_scores(ranking)
                 for topic_id, ranking in run.items()
             }
             ndcg = compute_official_ndcg(valid_qrels, score_map, cutoff=10).get("ndcg_cut_10", 0.0)
             recalls: Dict[int, List[float]] = {10: [], 50: [], 100: [], 1000: []}
             reciprocal_ranks: List[float] = []
             for topic_id, gold_map in valid_qrels.items():
-                ranked_ids = [doc_id for doc_id, _ in run.get(topic_id, [])]
+                ranked_ids = list(score_map.get(topic_id, {}))
                 gold_ids = set(gold_map)
                 for cutoff in recalls:
                     hits = len(set(ranked_ids[:cutoff]).intersection(gold_ids))

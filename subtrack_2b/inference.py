@@ -25,6 +25,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from tqdm import tqdm
@@ -46,12 +47,13 @@ if str(ROOT_DIR) not in sys.path:
 
 from subtrack_2b.dataset.dataset import (
     GroundedGenerationDataset,
+    _normalize_active_domains,
+    split_conversations_train_val,
     load_all_domains_data,
 )
 from subtrack_2b.models.model import ConversationalGenerator
+from subtrack_2b.generate_submission import validate_predictions
 from subtrack_2b.utils.utils import (
-    build_prompt,
-    build_refinement_prompt,
     compute_generation_metrics,
     detect_device,
     ensure_dir,
@@ -88,7 +90,7 @@ def main() -> None:
         "--split",
         type=str,
         default="dev",
-        choices=["dev", "train"],
+        choices=["dev", "train", "internal-val", "test"],
         help="Split da elaborare.",
     )
 
@@ -127,25 +129,29 @@ def main() -> None:
         help="Override della generation strategy.",
     )
 
+    parser.add_argument("--zero-shot", action="store_true", help="Usa esplicitamente il modello base.")
+    parser.add_argument("--data-dir", type=Path, help="Directory con le sottocartelle dei domini.")
+    parser.add_argument("--benchmark-file", help="Nome del benchmark in ciascuna sottocartella.")
+    parser.add_argument("--output-dir", type=Path, help="Directory nuova per i risultati della run.")
+    parser.add_argument("--topic-ids", type=Path, help="Lista di ID, uno per riga, per confronti appaiati.")
+    parser.add_argument("--evidence-strategy", choices=["prefix", "adaptive", "sentences"])
+    parser.add_argument("--skip-text-metrics", action="store_true")
     args = parser.parse_args()
+
+    if args.zero_shot and args.checkpoint:
+        parser.error("--zero-shot e --checkpoint sono incompatibili.")
+    if args.split == "test" and not (args.data_dir and args.benchmark_file):
+        parser.error("Per il test specifica --data-dir e --benchmark-file.")
+    if args.split == "test" and (args.domain or args.topic_ids or args.smoke_test or args.max_samples):
+        parser.error("Per il test configura i domini nel YAML e valuta tutti i loro turni.")
 
     # ==========================================================================
     # 1. CONFIG
     # ==========================================================================
 
     cfg_path = Path(args.config)
-
-    if not cfg_path.exists():
-        cfg_path = (
-            Path(__file__).resolve().parent
-            / "config"
-            / "config.yaml"
-        )
-
-    if not cfg_path.exists():
-        raise FileNotFoundError(
-            f"Config non trovato: {args.config}"
-        )
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Config non trovato: {cfg_path}")
 
     config = load_yaml(
         cfg_path
@@ -198,12 +204,11 @@ def main() -> None:
     # 3. DIRECTORIES / LOGGING
     # ==========================================================================
 
-    output_dir = ensure_dir(
-        paths_cfg.get(
-            "output_dir",
-            "outputs/subtrack_2b",
-        )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output_dir = args.output_dir or (
+        Path(paths_cfg.get("output_dir", "outputs/subtrack_2b")) / f"{args.split}_{stamp}"
     )
+    output_dir.mkdir(parents=True, exist_ok=False)
 
     log_dir = ensure_dir(
         paths_cfg.get(
@@ -282,6 +287,7 @@ def main() -> None:
             f"Ricevuto: {data_mode}"
         )
 
+    data_dir = args.data_dir or data_dir
     if not data_dir:
         raise ValueError(
             "Data directory non configurata."
@@ -348,42 +354,29 @@ def main() -> None:
         all_domains=all_domains,
         split_filename=split_filename,
         documents_filename=documents_filename,
+        require_corpus=args.split != "test",
     )
 
-    if not samples:
-        logger.error(
-            "Nessun dato trovato per split '%s'.",
-            args.split,
+    expected_domains = set(_normalize_active_domains(active_domains, all_domains))
+    missing_domains = expected_domains - set(diagnostics["domains_loaded"])
+    if missing_domains or not samples:
+        raise ValueError(f"Split vuoto o domini mancanti: {sorted(missing_domains)}")
+    for key in ("missing_gold_ids_count", "examples_without_evidence", "empty_query_count"):
+        if diagnostics[key]:
+            raise ValueError(f"Dati incompleti: {key}={diagnostics[key]}")
+    if args.split == "internal-val":
+        _, samples = split_conversations_train_val(
+            samples, val_ratio=float(config.get("training", {}).get("internal_val_ratio", 0.1)), seed=seed
         )
-        sys.exit(1)
-
-    logger.info(
-        "Campioni totali caricati: %d",
-        len(samples),
-    )
-
-    logger.info(
-        "Domini caricati: %s",
-        diagnostics.get(
-            "domains_loaded",
-            [],
-        ),
-    )
-
-    missing_ids = diagnostics.get(
-        "missing_gold_ids_count",
-        0,
-    )
-
-    if missing_ids > 0:
-        logger.warning(
-            "Gold document IDs mancanti: %d",
-            missing_ids,
-        )
-
-    # ==========================================================================
-    # 7. LIMITS
-    # ==========================================================================
+    if args.topic_ids:
+        wanted = [line.strip() for line in args.topic_ids.read_text(encoding="utf-8").splitlines() if line.strip()]
+        by_id = {sample.topic_id: sample for sample in samples}
+        if not wanted or len(set(wanted)) != len(wanted) or set(wanted) - by_id.keys():
+            raise ValueError("--topic-ids contiene ID assenti o duplicati oppure è vuoto.")
+        samples = [by_id[topic_id] for topic_id in wanted]
+    topics = {sample.topic_id for sample in samples}
+    if not topics or len(topics) != len(samples):
+        raise ValueError("Split senza turni oppure con identificatori duplicati.")
 
     if args.smoke_test:
         samples = samples[:5]
@@ -417,52 +410,18 @@ def main() -> None:
     # 8. CHECKPOINT
     # ==========================================================================
 
-    default_checkpoint = (
-        Path(
-            paths_cfg.get(
-                "checkpoint_dir",
-                "checkpoints/subtrack_2b",
-            )
-        )
-        / "best_model"
-    )
-
-    checkpoint_dir = (
-        Path(args.checkpoint)
-        if args.checkpoint
-        else default_checkpoint
-    )
-
-    logger.info(
-        "Checkpoint selezionato: %s",
-        checkpoint_dir,
-    )
-
-    # ==========================================================================
-    # 9. MODEL
-    # ==========================================================================
-
-    generator = ConversationalGenerator.from_pretrained(
-        config,
-        device=device,
-        is_training=False,
-    )
-
-    if checkpoint_dir.exists():
-        generator.load_checkpoint(
-            checkpoint_dir
-        )
-
-        logger.info(
-            "Checkpoint caricato correttamente."
-        )
-
-    else:
-        logger.warning(
-            "Checkpoint '%s' non trovato. "
-            "Procedo in zero-shot.",
-            checkpoint_dir,
-        )
+    checkpoint_root = Path(paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2b"))
+    default_checkpoint = checkpoint_root / general_cfg.get("run_tag", "subtrack_2b_run") / "best_model"
+    checkpoint_dir = None if args.zero_shot else Path(args.checkpoint or default_checkpoint)
+    if checkpoint_dir is not None and not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"Checkpoint mancante: {checkpoint_dir}. Per il modello base usa --zero-shot.")
+    if args.split == "test" and (
+        prompt_cfg.get("ablation") == "E" or prompt_cfg.get("use_subquestion_reasoning")
+    ):
+        parser.error("L'input di test non deve usare annotazioni di reasoning.")
+    generator = ConversationalGenerator.from_pretrained(config, device=device, is_training=False)
+    if checkpoint_dir is not None:
+        generator.load_checkpoint(checkpoint_dir)
 
     # ==========================================================================
     # 10. GENERATION CONFIG
@@ -599,6 +558,7 @@ def main() -> None:
     # - evidence budget
     # - chat template tokenization
     # - ablation
+    evidence_strategy = args.evidence_strategy or prompt_cfg.get("evidence_strategy", "adaptive")
     generation_dataset = GroundedGenerationDataset(
         samples=samples,
         tokenizer=generator.tokenizer,
@@ -622,6 +582,7 @@ def main() -> None:
             )
         ),
         is_training=False,
+        evidence_strategy=evidence_strategy,
     )
 
     # ==========================================================================
@@ -655,7 +616,8 @@ def main() -> None:
         item = generation_dataset[idx]
 
         sample = item["sample"]
-        prompt_str = item["prompt_text"]
+        prompt_ids = item["prompt_ids"]
+        refine_diagnostics = None
 
         # ------------------------------------------------------------------
         # Candidate generation
@@ -668,7 +630,7 @@ def main() -> None:
             ):
                 generated = (
                     generator.generate_single(
-                        prompt=prompt_str,
+                        prompt=prompt_ids,
                         max_new_tokens=max_new_tokens,
                         do_sample=True,
                         temperature=temperature,
@@ -695,7 +657,7 @@ def main() -> None:
         else:
             generated_answer = (
                 generator.generate_single(
-                    prompt=prompt_str,
+                    prompt=prompt_ids,
                     max_new_tokens=max_new_tokens,
                     do_sample=do_sample,
                     temperature=temperature,
@@ -709,19 +671,13 @@ def main() -> None:
         # Optional refinement
         # ------------------------------------------------------------------
         if strategy == "refine":
-            refine_prompt = (
-                build_refinement_prompt(
-                    query=sample.query,
-                    conversation_history=sample.conversation_history,
-                    evidence_passages=sample.gold_passages,
-                    draft_answer=generated_answer,
-                    domain=sample.domain,
-                )
+            _, refine_ids, refine_diagnostics = generation_dataset.prepare_prompt(
+                sample, draft_answer=generated_answer
             )
 
             generated_answer = (
                 generator.generate_single(
-                    prompt=refine_prompt,
+                    prompt=refine_ids,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     temperature=temperature,
@@ -760,7 +716,10 @@ def main() -> None:
             "query": sample.query,
             "conversation_history": sample.conversation_history,
             "prediction": generated_answer,
-            "reference": sample.answer,
+            "reference": sample.answer if args.split != "test" else None,
+            "prompt": item["prompt_diagnostics"],
+            "refine_prompt": refine_diagnostics,
+            "gold_passages": sample.gold_passages if args.split != "test" else None,
             "gold_doc_ids": sample.gold_doc_ids,
             "num_evidence_passages": len(
                 sample.gold_passages
@@ -777,7 +736,7 @@ def main() -> None:
         # ------------------------------------------------------------------
         # Metrics grouping
         # ------------------------------------------------------------------
-        if sample.answer:
+        if sample.answer and args.split != "test" and not args.skip_text_metrics:
             domain_preds[
                 sample.domain
             ].append(
@@ -841,6 +800,31 @@ def main() -> None:
         / f"generation_{args.split}.jsonl"
     )
 
+    metadata = {
+        "model": config.get("model", {}).get("name"),
+        "model_revision": getattr(generator.model.config, "_commit_hash", None)
+        or config.get("model", {}).get("revision"),
+        "device": str(device),
+        "loaded_in_4bit": bool(getattr(generator.model, "is_loaded_in_4bit", False)),
+        "checkpoint": str(checkpoint_dir.resolve()) if checkpoint_dir is not None else None,
+        "split": args.split,
+        "config": config,
+        "cli": vars(args) | {
+            "data_dir": str(args.data_dir) if args.data_dir else None,
+            "topic_ids": str(args.topic_ids) if args.topic_ids else None,
+            "output_dir": str(output_dir),
+        },
+        "evidence_strategy": evidence_strategy,
+        "resolved_strategy": strategy,
+        "documented_missing_gold_ids": diagnostics.get("documented_missing_gold_ids_count", 0),
+        "topic_ids": [sample.topic_id for sample in samples],
+    }
+    save_json(metadata, output_dir / "run.json")
+    (output_dir / "topic_ids.txt").write_text(
+        "\n".join(metadata["topic_ids"]) + "\n", encoding="utf-8"
+    )
+    if args.split == "test":
+        validate_predictions(official_predictions, set(metadata["topic_ids"]))
     save_jsonl(
         official_predictions,
         generation_file,
@@ -880,7 +864,9 @@ def main() -> None:
         if record.get("reference")
     ]
 
-    if predictions_with_refs:
+    if args.skip_text_metrics:
+        logger.info("Metriche testuali disabilitate per questa run.")
+    elif predictions_with_refs:
         all_predictions = [
             record["prediction"]
             for record in predictions_with_refs
@@ -943,9 +929,7 @@ def main() -> None:
             "samples_evaluated": len(
                 all_predictions
             ),
-            "checkpoint": str(
-                checkpoint_dir
-            ),
+            "checkpoint": metadata["checkpoint"],
             "strategy": strategy,
             "num_candidates": num_candidates,
             "ablation": prompt_cfg.get(

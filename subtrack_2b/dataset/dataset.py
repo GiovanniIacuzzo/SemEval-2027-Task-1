@@ -27,6 +27,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -34,7 +35,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from subtrack_2b.utils.utils import build_prompt, count_tokens, truncate_history
+from subtrack_2b.utils.utils import build_prompt, build_refinement_prompt, truncate_history
 
 logger = logging.getLogger("subtrack_2b")
 
@@ -159,6 +160,7 @@ def resolve_gold_passages(
     turn_record: Dict[str, Any],
     corpus: Dict[str, str],
     diagnostics: Dict[str, Any],
+    dropped_gold_ids: frozenset[str] = frozenset(),
 ) -> List[str]:
     """
     Risolve il testo dell'evidenza gold.
@@ -216,22 +218,17 @@ def resolve_gold_passages(
         if not doc_id_str:
             continue
 
-        if doc_id_str in corpus:
-            text = str(corpus[doc_id_str]).strip()
-
-            if text:
-                passages.append(text)
-        else:
-            has_missing = True
-
-            diagnostics["missing_gold_ids_count"] = (
-                diagnostics.get("missing_gold_ids_count", 0) + 1
-            )
-
-            diagnostics.setdefault(
-                "missing_doc_ids_set",
-                set(),
-            ).add(doc_id_str)
+        text = corpus.get(doc_id_str, "").strip()
+        if text:
+            passages.append(text)
+            continue
+        if doc_id_str in dropped_gold_ids:
+            key = "documented_missing_gold_ids_count"
+            diagnostics[key] = diagnostics.get(key, 0) + 1
+            continue
+        has_missing = True
+        diagnostics["missing_gold_ids_count"] = diagnostics.get("missing_gold_ids_count", 0) + 1
+        diagnostics.setdefault("missing_doc_ids_set", set()).add(doc_id_str)
 
     if has_missing:
         diagnostics["examples_with_missing_evidence"] = (
@@ -346,6 +343,7 @@ def load_domain_turn_samples(
     documents_path: Union[str, Path],
     domain: str,
     diagnostics: Dict[str, Any],
+    dropped_gold_ids: frozenset[str] = frozenset(),
 ) -> List[GroundedTurnSample]:
     """
     Carica un dominio completo e converte:
@@ -353,7 +351,7 @@ def load_domain_turn_samples(
         conversation -> individual turns
     """
 
-    corpus = load_corpus(documents_path)
+    corpus = load_corpus(documents_path) if Path(documents_path).is_file() else {}
     conversations = load_benchmark_records(benchmark_path)
 
     turn_samples: List[GroundedTurnSample] = []
@@ -441,11 +439,7 @@ def load_domain_turn_samples(
                 if str(x).strip()
             ]
 
-            passages = resolve_gold_passages(
-                turn,
-                corpus,
-                diagnostics,
-            )
+            passages = resolve_gold_passages(turn, corpus, diagnostics, dropped_gold_ids)
 
             if not passages:
                 diagnostics["examples_without_evidence"] = (
@@ -533,12 +527,15 @@ def load_all_domains_data(
     all_domains: List[str],
     split_filename: str,
     documents_filename: str = "documents.jsonl",
+    require_corpus: bool = True,
 ) -> Tuple[List[GroundedTurnSample], Dict[str, Any]]:
     """
     Carica tutti i domini selezionati.
     """
 
     base_path = Path(base_dir)
+    manifest_path = base_path.parent / "split_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() and require_corpus else {}
 
     domains_to_load = _normalize_active_domains(
         active_domains,
@@ -549,6 +546,7 @@ def load_all_domains_data(
 
     diagnostics: Dict[str, Any] = {
         "missing_gold_ids_count": 0,
+        "documented_missing_gold_ids_count": 0,
         "examples_with_missing_evidence": 0,
         "examples_without_evidence": 0,
         "empty_query_count": 0,
@@ -572,7 +570,7 @@ def load_all_domains_data(
             )
             continue
 
-        if not documents_file.exists():
+        if require_corpus and not documents_file.exists():
             logger.warning(
                 "Corpus mancante per il dominio '%s': %s",
                 domain,
@@ -585,6 +583,7 @@ def load_all_domains_data(
             documents_path=documents_file,
             domain=domain,
             diagnostics=diagnostics,
+            dropped_gold_ids=frozenset(manifest.get("track2_recor", {}).get(domain, {}).get("dropped_gold_ids", [])),
         )
 
         all_samples.extend(samples)
@@ -631,57 +630,26 @@ def split_conversations_train_val(
             f"val_ratio deve essere compreso tra 0 e 1; ricevuto {val_ratio}"
         )
 
-    conv_map: Dict[str, List[GroundedTurnSample]] = {}
-
+    conversations_by_domain = defaultdict(set)
     for sample in samples:
-        conv_map.setdefault(
-            sample.conversation_id,
-            [],
-        ).append(sample)
+        conversations_by_domain[sample.domain].add(sample.conversation_id)
 
-    unique_conv_ids = sorted(conv_map.keys())
+    rng = random.Random(seed)
+    validation = set()
+    for domain, conversations in sorted(conversations_by_domain.items()):
+        ids = sorted(conversations)
+        if len(ids) < 2:
+            logger.warning("Dominio %s senza conversazioni sufficienti per la validation.", domain)
+            continue
+        rng.shuffle(ids)
+        count = min(len(ids) - 1, max(1, round(len(ids) * val_ratio)))
+        validation.update((domain, conv_id) for conv_id in ids[:count])
 
-    if len(unique_conv_ids) < 2:
-        logger.warning(
-            "Sono presenti meno di 2 conversazioni: "
-            "impossibile creare uno split train/validation robusto."
-        )
-        return list(samples), []
-
-    rng = np.random.RandomState(seed)
-    rng.shuffle(unique_conv_ids)
-
-    n_val_convs = max(
-        1,
-        int(round(len(unique_conv_ids) * val_ratio)),
-    )
-
-    n_val_convs = min(
-        n_val_convs,
-        len(unique_conv_ids) - 1,
-    )
-
-    val_conv_ids = set(
-        unique_conv_ids[:n_val_convs]
-    )
-
-    train_samples = [
-        sample
-        for sample in samples
-        if sample.conversation_id not in val_conv_ids
-    ]
-
-    val_samples = [
-        sample
-        for sample in samples
-        if sample.conversation_id in val_conv_ids
-    ]
-
-    logger.info(
-        "Conversation-level split: %d conversazioni train / %d validation",
-        len(unique_conv_ids) - n_val_convs,
-        n_val_convs,
-    )
+    train_samples = []
+    val_samples = []
+    for sample in samples:
+        partition = val_samples if (sample.domain, sample.conversation_id) in validation else train_samples
+        partition.append(sample)
 
     return train_samples, val_samples
 
@@ -926,6 +894,7 @@ def _truncate_passages_to_budget(
     passages: List[str],
     tokenizer: Any,
     max_tokens: int,
+    focus: str = "",
 ) -> List[str]:
     """
     Mantiene tutti i passage, quando possibile, distribuendo il budget
@@ -1019,10 +988,29 @@ def _truncate_passages_to_budget(
 
     truncated_passages: List[str] = []
 
-    for tokens, allocation in zip(tokenized, allocations):
+    focus_words = set(re.findall(r"\b\w{3,}\b", focus.lower()))
+    for passage, tokens, allocation in zip(passages, tokenized, allocations):
         if not tokens:
             continue
 
+        if len(tokens) <= allocation:
+            truncated_passages.append(passage)
+            continue
+        if focus_words:
+            sentences = re.split(r"(?<=[.!?])\s+|\n+", passage)
+            order = sorted(
+                range(len(sentences)),
+                key=lambda i: -len(focus_words & set(re.findall(r"\b\w{3,}\b", sentences[i].lower()))),
+            )
+            selected = []
+            for i in order:
+                candidate = sorted([*selected, i])
+                text = " ".join(sentences[j] for j in candidate)
+                if len(_tokenize_ids(tokenizer, text)) <= allocation:
+                    selected = candidate
+            if selected:
+                truncated_passages.append(" ".join(sentences[i] for i in selected))
+                continue
         clipped = tokens[:allocation]
 
         text = tokenizer.decode(
@@ -1040,170 +1028,30 @@ def _truncate_passages_to_budget(
 # CHAT TEMPLATE HELPERS
 # ==============================================================================
 
-def _build_chat_messages(prompt_text: str) -> List[Dict[str, str]]:
-    """
-    Rappresentazione chat coerente con l'inference.
-
-    Il prompt builder esistente resta responsabile della struttura testuale
-    e delle istruzioni; il tokenizer chat template aggiunge il formato
-    conversazionale del modello instruction-tuned.
-    """
-
-    return [
-        {
-            "role": "user",
-            "content": prompt_text,
-        }
-    ]
-
-
-def _encode_prompt_with_chat_template(
-    tokenizer: Any,
-    prompt_text: str,
-) -> List[int]:
-    """
-    Tokenizza il prompt usando il chat template quando disponibile.
-
-    Gestisce in modo robusto le diverse forme di output restituite
-    da differenti versioni di Transformers:
-
-        list[int]
-        list[list[int]]
-        dict con input_ids
-        tensor
-
-    Se l'output non contiene effettivamente token IDs interi,
-    effettua un fallback esplicito alla tokenizzazione standard.
-    """
-
-    messages = [
-        {
-            "role": "user",
-            "content": prompt_text,
-        }
-    ]
-
-    # ----------------------------------------------------------------------
-    # 1. Chat template
-    # ----------------------------------------------------------------------
+def _encode_prompt_with_chat_template(tokenizer: Any, prompt_text: str) -> List[int]:
+    """Encode the complete chat prompt once for both training and generation."""
     if getattr(tokenizer, "chat_template", None):
-        try:
-            encoded = tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-            )
-
-            # Caso Tensor
-            if isinstance(encoded, torch.Tensor):
-                if encoded.ndim == 2:
-                    encoded = encoded[0]
-
-                encoded_list = encoded.tolist()
-
-            # Caso dict inatteso ma compatibile
-            elif isinstance(encoded, dict):
-                encoded_list = encoded.get(
-                    "input_ids",
-                    []
-                )
-
-                if isinstance(
-                    encoded_list,
-                    torch.Tensor,
-                ):
-                    if encoded_list.ndim == 2:
-                        encoded_list = encoded_list[0]
-
-                    encoded_list = encoded_list.tolist()
-
-            else:
-                encoded_list = encoded
-
-            # ------------------------------------------------------------------
-            # 2. Normalizzazione list
-            # ------------------------------------------------------------------
-            if isinstance(
-                encoded_list,
-                list,
-            ):
-                # Caso [[1, 2, 3]]
-                if (
-                    len(encoded_list) == 1
-                    and isinstance(
-                        encoded_list[0],
-                        list,
-                    )
-                ):
-                    encoded_list = encoded_list[0]
-
-                # Verifica finale: devono essere token IDs numerici.
-                if all(
-                    isinstance(
-                        token_id,
-                        int,
-                    )
-                    for token_id in encoded_list
-                ):
-                    return [
-                        int(token_id)
-                        for token_id in encoded_list
-                    ]
-
-            logger.warning(
-                "apply_chat_template() ha restituito una struttura "
-                "non valida per input_ids: %s. "
-                "Fallback su tokenizer.encode().",
-                type(encoded),
-            )
-
-        except Exception as exc:
-            logger.warning(
-                "Errore durante apply_chat_template(): %s. "
-                "Fallback su tokenizer.encode().",
-                exc,
-            )
-
-    # ----------------------------------------------------------------------
-    # 3. Fallback robusto
-    # ----------------------------------------------------------------------
-    encoded = tokenizer.encode(
-        prompt_text,
-        add_special_tokens=True,
-    )
-
-    if isinstance(
-        encoded,
-        torch.Tensor,
-    ):
-        if encoded.ndim == 2:
-            encoded = encoded[0]
-
+        encoded = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+    else:
+        encoded = tokenizer.encode(prompt_text, add_special_tokens=True)
+    if isinstance(encoded, dict):
+        encoded = encoded["input_ids"]
+    if isinstance(encoded, torch.Tensor):
         encoded = encoded.tolist()
+    if len(encoded) == 1 and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    if not encoded or not all(isinstance(token, int) for token in encoded):
+        raise TypeError("Il tokenizer non ha restituito una sequenza di ID interi.")
+    return list(encoded)
 
-    encoded = list(encoded)
-
-    if not all(
-        isinstance(
-            token_id,
-            int,
-        )
-        for token_id in encoded
-    ):
-        raise TypeError(
-            "La tokenizzazione del prompt ha prodotto valori non interi. "
-            f"Primo tipo rilevato: "
-            f"{type(encoded[0]) if encoded else 'N/A'}"
-        )
-
-    return [
-        int(token_id)
-        for token_id in encoded
-    ]
 
 # ==============================================================================
-# DATASET
+# SFT DATASET
 # ==============================================================================
 
 class GroundedGenerationDataset(Dataset):
@@ -1230,6 +1078,7 @@ class GroundedGenerationDataset(Dataset):
         include_domain: bool = True,
         use_subquestion_reasoning: bool = False,
         is_training: bool = True,
+        evidence_strategy: str = "adaptive",
     ) -> None:
         self.samples = samples
         self.tokenizer = tokenizer
@@ -1255,184 +1104,77 @@ class GroundedGenerationDataset(Dataset):
         )
         self.is_training = is_training
 
-        self.truncation_count = 0
+        if evidence_strategy not in {"prefix", "adaptive", "sentences"}:
+            raise ValueError(f"Strategia evidenza sconosciuta: {evidence_strategy}")
+        if min(self.max_input_tokens, self.max_output_tokens) <= 0:
+            raise ValueError("I limiti dei token devono essere positivi.")
+        self.evidence_strategy = evidence_strategy
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _prepare_prompt(
-        self,
-        sample: GroundedTurnSample,
-    ) -> Tuple[str, List[int], List[Dict[str, str]]]:
-        """
-        Costruisce un prompt rispettando un budget token strutturato.
+    def prepare_prompt(
+        self, sample: GroundedTurnSample, draft_answer: Optional[str] = None
+    ) -> Tuple[str, List[int], Dict[str, Any]]:
+        use_history = self.ablation in {"B", "D", "E"} or draft_answer is not None
+        use_evidence = self.ablation in {"C", "D", "E"} or draft_answer is not None
+        original_history = sample.conversation_history if use_history else ""
+        history = _truncate_history_by_turns(original_history, self.max_history_turns)
+        history_limit = self.max_input_tokens // 4
+        history, _ = truncate_history(history, history_limit, self.tokenizer)
+        passages = sample.gold_passages if use_evidence else []
 
-        Ordine di priorità:
-            1. query
-            2. evidence
-            3. history recente
-            4. history remota
-        """
-
-        # ----------------------------------------------------------------------
-        # History: prima limite a turni, poi a token.
-        # ----------------------------------------------------------------------
-        history = _truncate_history_by_turns(
-            sample.conversation_history,
-            self.max_history_turns,
-        )
-
-        initial_history_budget = max(
-            64,
-            self.max_input_tokens // 4,
-        )
-
-        history, _ = truncate_history(
-            history,
-            max_tokens=initial_history_budget,
-            tokenizer=self.tokenizer,
-        )
-
-        evidence_budget = max(
-            128,
-            self.max_input_tokens // 2,
-        )
-
-        evidence = _truncate_passages_to_budget(
-            sample.gold_passages,
-            tokenizer=self.tokenizer,
-            max_tokens=evidence_budget,
-        )
-
-        # ----------------------------------------------------------------------
-        # Prima costruzione completa.
-        # ----------------------------------------------------------------------
-        prompt_text = build_prompt(
-            query=sample.query,
-            conversation_history=history,
-            evidence_passages=evidence,
-            domain=sample.domain,
-            subquestion_reasoning=sample.subquestion_reasoning,
-            ablation=self.ablation,
-            include_domain=self.include_domain,
-            use_subquestion_reasoning=self.use_subquestion_reasoning,
-        )
-
-        prompt_ids = _encode_prompt_with_chat_template(
-            self.tokenizer,
-            prompt_text,
-        )
-
-        # ----------------------------------------------------------------------
-        # Riduzione progressiva.
-        # NON usare prompt_ids[-max_input_tokens:]:
-        # potrebbe eliminare query/system instruction.
-        # ----------------------------------------------------------------------
-        current_history_budget = initial_history_budget
-        current_evidence_budget = evidence_budget
-
-        for _ in range(8):
-            if len(prompt_ids) <= self.max_input_tokens:
-                break
-
-            # Prima riduci history.
-            if current_history_budget > 32:
-                current_history_budget = max(
-                    32,
-                    int(current_history_budget * 0.65),
+        def render(evidence):
+            if draft_answer is not None:
+                prompt = build_refinement_prompt(
+                    sample.query, history, evidence, draft_answer, sample.domain
                 )
-
-                history, _ = truncate_history(
-                    history,
-                    max_tokens=current_history_budget,
-                    tokenizer=self.tokenizer,
-                )
-
-            # Se history è già minima, riduci evidence.
-            elif current_evidence_budget > 64:
-                current_evidence_budget = max(
-                    64,
-                    int(current_evidence_budget * 0.70),
-                )
-
-                evidence = _truncate_passages_to_budget(
-                    sample.gold_passages,
-                    tokenizer=self.tokenizer,
-                    max_tokens=current_evidence_budget,
-                )
-
             else:
-                # Non possiamo più sacrificare significativamente il contesto.
-                break
-
-            prompt_text = build_prompt(
-                query=sample.query,
-                conversation_history=history,
-                evidence_passages=evidence,
-                domain=sample.domain,
-                subquestion_reasoning=sample.subquestion_reasoning,
-                ablation=self.ablation,
-                include_domain=self.include_domain,
-                use_subquestion_reasoning=self.use_subquestion_reasoning,
-            )
-
-            prompt_ids = _encode_prompt_with_chat_template(
-                self.tokenizer,
-                prompt_text,
-            )
-
-        # ----------------------------------------------------------------------
-        # Fallback estremo:
-        # query + prompt minimale, senza history/evidence.
-        #
-        # Questo caso è raro e mantiene almeno la query.
-        # ----------------------------------------------------------------------
-        if len(prompt_ids) > self.max_input_tokens:
-            logger.warning(
-                "Prompt ancora troppo lungo dopo truncation strutturata "
-                "(%d > %d). Fallback su query senza history/evidence "
-                "per sample %s.",
-                len(prompt_ids),
-                self.max_input_tokens,
-                sample.topic_id,
-            )
-
-            prompt_text = build_prompt(
-                query=sample.query,
-                conversation_history="No previous conversation.",
-                evidence_passages=[],
-                domain=sample.domain,
-                subquestion_reasoning=None,
-                ablation="A",
-                include_domain=self.include_domain,
-                use_subquestion_reasoning=False,
-            )
-
-            prompt_ids = _encode_prompt_with_chat_template(
-                self.tokenizer,
-                prompt_text,
-            )
-
-            # Solo nel caso patologico in cui persino la query/prompt minimale
-            # superi il limite.
-            if len(prompt_ids) > self.max_input_tokens:
-                logger.warning(
-                    "Anche il prompt minimale supera max_input_tokens. "
-                    "Applicazione di emergency truncation."
+                prompt = build_prompt(
+                    query=sample.query,
+                    conversation_history=history,
+                    evidence_passages=evidence,
+                    domain=sample.domain,
+                    subquestion_reasoning=sample.subquestion_reasoning,
+                    ablation=self.ablation,
+                    include_domain=self.include_domain,
+                    use_subquestion_reasoning=self.use_subquestion_reasoning,
                 )
+            return prompt, _encode_prompt_with_chat_template(self.tokenizer, prompt)
 
-                prompt_ids = prompt_ids[
-                    :self.max_input_tokens
-                ]
+        _, base_ids = render([])
+        while len(base_ids) + bool(passages) * 32 > self.max_input_tokens and history_limit:
+            history_limit //= 2
+            history, _ = truncate_history(history, history_limit, self.tokenizer)
+            _, base_ids = render([])
+        if len(base_ids) > self.max_input_tokens:
+            raise ValueError(f"{sample.topic_id}: domanda, istruzioni o bozza oltre il budget del prompt.")
 
-        if len(prompt_ids) > self.max_input_tokens:
-            self.truncation_count += 1
-
-        messages = _build_chat_messages(
-            prompt_text
-        )
-
-        return prompt_text, prompt_ids, messages
+        budget = self.max_input_tokens - len(base_ids)
+        if self.evidence_strategy == "prefix":
+            budget = min(budget, self.max_input_tokens // 2)
+        focus = f"{sample.query} {history}" if self.evidence_strategy == "sentences" else ""
+        evidence = _truncate_passages_to_budget(passages, self.tokenizer, budget, focus)
+        prompt, ids = render(evidence)
+        while len(ids) > self.max_input_tokens and budget:
+            budget = max(0, budget - (len(ids) - self.max_input_tokens) - 1)
+            evidence = _truncate_passages_to_budget(passages, self.tokenizer, budget, focus)
+            prompt, ids = render(evidence)
+        if passages and not evidence:
+            raise ValueError(f"{sample.topic_id}: spazio insufficiente per i passaggi gold.")
+        if self.is_training:
+            return prompt, ids, {}
+        diagnostics = {
+            "input_tokens": len(ids),
+            "history_truncated": use_history and history != original_history,
+            "evidence_truncated": evidence != passages,
+            "passages_used": len(evidence),
+            "evidence_tokens": sum(len(_tokenize_ids(self.tokenizer, text)) for text in evidence),
+            "original_evidence_tokens": sum(len(_tokenize_ids(self.tokenizer, text)) for text in passages),
+            "evidence_shown": evidence,
+            "history_shown": history,
+        }
+        return prompt, ids, diagnostics
 
     def __getitem__(
         self,
@@ -1440,7 +1182,7 @@ class GroundedGenerationDataset(Dataset):
     ) -> Dict[str, Any]:
         sample = self.samples[idx]
 
-        prompt_text, prompt_ids, messages = self._prepare_prompt(
+        prompt_text, prompt_ids, diagnostics = self.prepare_prompt(
             sample
         )
 
@@ -1451,7 +1193,7 @@ class GroundedGenerationDataset(Dataset):
             return {
                 "prompt_ids": prompt_ids,
                 "prompt_text": prompt_text,
-                "messages": messages,
+                "prompt_diagnostics": diagnostics,
                 "sample": sample,
             }
 

@@ -176,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--repo-id", help="Hugging Face repository, e.g. username/reteco-semeval2027-subtrack-2b")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Config YAML used by train.py")
-    p.add_argument("--checkpoint-dir", type=Path, default=None, help="Checkpoint root used by train.py; defaults to paths.checkpoint_dir in config")
+    p.add_argument("--checkpoint-dir", type=Path, default=None, help="Checkpoint root used by train.py; defaults to paths.checkpoint_dir/general.run_tag in config")
     p.add_argument("--model-dir", type=Path, default=None, help="Selected checkpoint directory; default: <checkpoint-dir>/best_model")
     p.add_argument("--tokenizer-dir", type=Path, default=None, help="Tokenizer directory; default: <checkpoint-dir>/tokenizer")
     p.add_argument("--base-model-id", default=None, help="Public HF ID for the exact base model, only needed when adapter metadata contains a local filesystem path")
@@ -201,7 +201,8 @@ def main() -> int:
     cfg = read_yaml(config_path)
     paths_cfg = cfg.get("paths", {}) if isinstance(cfg.get("paths", {}), dict) else {}
     configured_ckpt = paths_cfg.get("checkpoint_dir", "checkpoints/subtrack_2b")
-    checkpoint_dir = resolve_path(args.checkpoint_dir or configured_ckpt)
+    run_tag = cfg.get("general", {}).get("run_tag", "subtrack_2b_run")
+    checkpoint_dir = resolve_path(args.checkpoint_dir or (Path(configured_ckpt) / run_tag))
     model_dir = resolve_path(args.model_dir) if args.model_dir else checkpoint_dir / "best_model"
     tokenizer_dir = resolve_path(args.tokenizer_dir) if args.tokenizer_dir else checkpoint_dir / "tokenizer"
 

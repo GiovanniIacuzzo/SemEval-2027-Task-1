@@ -8,14 +8,16 @@ dependencies:
   - python=3.10
   - pip>=23.3
   - git
-  - openjdk>=11
+  - openjdk=21
   - pip:
-      - torch>=2.1.0
+      - torch>=2.4
       - torchvision
       - torchaudio
-      - transformers>=4.40.0
-      - accelerate>=0.28.0
-      - peft>=0.10.0
+      - transformers>=4.51,<5
+      - jinja2>=3.1
+      - accelerate>=1.2
+      - peft>=0.20
+      - bitsandbytes>=0.48; sys_platform == "linux" and platform_machine == "x86_64"
       - sentencepiece>=0.2.0
       - protobuf
       - pytrec_eval>=0.5
@@ -25,4 +27,5 @@ dependencies:
       - tqdm>=4.66.0
       - matplotlib>=3.8.0      
       - gensim>=4.3.2
-      - pyserini>=0.22.0
+      - pyserini==1.3.0
+      - openai==1.109.1
