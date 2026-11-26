@@ -1,0 +1,35 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=26mm]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[italian]{babel}
+\usepackage{amsmath,amssymb,graphicx,booktabs}
+\usepackage{array,tabularx}
+\usepackage[hidelinks]{hyperref}
+\setlength{\emergencystretch}{2em}
+
+\graphicspath{{images/}}
+
+\title{SemEval 2027 Task 1}
+\author{Giovanni Giuseppe Iacuzzo}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+In una conversazione, identificare il passaggio che risolve un riferimento implicito e formulare una risposta fedele a quel passaggio richiedono decisioni diverse. Studiamo se riapplicare un singolo strato di un Transformer a pesi condivisi durante l'inferenza possa migliorare una delle due decisioni a un costo sostenibile. Usiamo il subtrack 2a di RETECO per variare la profondità del riordinatore su candidati fissati e il 2b per variare quella del generatore a parità di passaggi di riferimento. Presentiamo l'implementazione e una prima misura della qualità dei candidati. Su 280 turni di validazione interna appartenenti a dieci domini, dopo un'epoca di addestramento del bi-encoder, la fusione dei ranking contestuali raggiunge una nDCG@10 macro di 0,6242, a fronte di 0,4167 per BM25 e 0,3801 per il modello denso. Il vantaggio relativo dei due retriever cambia segno tra i due gruppi di collezioni rappresentati. Queste misure caratterizzano il primo stadio del sistema. Per il riordinamento e la generazione definiamo confronti appaiati rispetto al decoder a profondità originale; la stima dell'effetto della ricorrenza resta aperta.
+\end{abstract}
+\noindent\textbf{Parole chiave}\quad recupero conversazionale; riordinamento neurale; generazione fondata su evidenze; profondità ricorrente; RETECO.
+
+\input{sections/01_introduction}
+\input{sections/02_state_of_art}
+\input{sections/03_metodology}
+\input{sections/04_results}
+\input{sections/05_discussion}
+\input{sections/06_conclusion}
+
+\bibliographystyle{plain}
+\bibliography{references}
+\end{document}

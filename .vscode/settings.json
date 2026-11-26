@@ -1,4 +1,38 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:pip",
+    "latex-workshop.latex.outDir": "%DIR%/compiler",
+    "latex-workshop.latex.recipes": [
+        {
+            "name": "Compile & Move PDF",
+            "tools": [
+                "latexmk",
+                "copyPdf"
+            ]
+        }
+    ],
+    "latex-workshop.latex.tools": [
+        {
+            "name": "latexmk",
+            "command": "latexmk",
+            "args": [
+                "-synctex=1",
+                "-interaction=nonstopmode",
+                "-file-line-error",
+                "-pdf",
+                "-outdir=%OUTDIR%",
+                "%DOC%"
+            ],
+            "env": {}
+        },
+        {
+            "name": "copyPdf",
+            "command": "cp",
+            "args": [
+                "%OUTDIR%/%DOCFILE%.pdf",
+                "%DIR%/"
+            ],
+            "env": {}
+        }
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

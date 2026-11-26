@@ -6,6 +6,7 @@ hf_release/
 checkpoints/
 outputs/
 __pycache__/
+compiler/
+pdf/
 *.log
-*.pdf
 .DS_Store
